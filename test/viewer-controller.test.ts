@@ -9,10 +9,19 @@ class ViewerNode extends EventTarget {
   height = 0;
   src = "";
   alt = "";
+  clientWidth = 0;
+  clientHeight = 0;
+  parentElement: ViewerNode | null = null;
+  rect = { left: 0, top: 0, width: 0, height: 0 };
+  captured = new Set<number>();
   style = { left: "", top: "", colorScheme: "", setProperty() {} };
   setAttribute() {}
   removeAttribute(name: string) { if (name === "src") this.src = ""; }
   getContext() { return { drawImage() {} }; }
+  getBoundingClientRect() { return this.rect; }
+  setPointerCapture(id: number) { this.captured.add(id); }
+  hasPointerCapture(id: number) { return this.captured.has(id); }
+  releasePointerCapture(id: number) { this.captured.delete(id); }
 }
 
 class ViewerDecoder {
@@ -70,6 +79,8 @@ for (const mode of ["websocket", "relay-preview", "relay-host", "hevc-capture-fa
   const requestedCodecs: string[] = [];
   const probes: Array<(result: VideoDecoderSupport) => void> = [];
   const reads: Array<{ streamId: string; resolve: (result: unknown) => void }> = [];
+  const served = new Map<string, number>();
+  let currentStream = "";
   const stops: string[] = [];
   const attachments: unknown[] = [];
   const calls: string[] = [];
@@ -107,6 +118,7 @@ for (const mode of ["websocket", "relay-preview", "relay-host", "hevc-capture-fa
   const replacements = {
     document, window,
     matchMedia: () => ({ matches: false }),
+    getComputedStyle: () => ({ maxHeight: "none" }),
     IntersectionObserver: class { observe() {} disconnect() {} },
     VideoDecoder: BrowserDecoder, WebSocket: BrowserSocket,
     EncodedVideoChunk: class { constructor(readonly init: EncodedVideoChunkInit) {} },
@@ -129,20 +141,27 @@ for (const mode of ["websocket", "relay-preview", "relay-host", "hevc-capture-fa
     assert.ok(resolve, "a stream descriptor was requested");
     const streamId = (++streamNumber).toString(16).padStart(48, "0");
     const format = requestedCodecs.at(-1);
-    resolve({ content: [], structuredContent: { sessionId: current.id, streamId, url: "ws://127.0.0.1:1234/video/token", format, codec: format === "hevc" ? "hev1.1.6.L150.B0" : "avc1.42E01F", fps: 30 } });
+    resolve({ content: [], structuredContent: { sessionId: current.id, streamId, url: "ws://127.0.0.1:1234/video/token", format, codec: format === "hevc" ? "hev1.1.6.L150.B0" : "avc1.42E01F", fps: 60 } });
+    currentStream = streamId;
     await flush();
     return streamId;
   };
+  // The server answers pipelined reads in order and numbers each batch it serves.
+  const takeRead = () => {
+    const index = reads.findIndex(read => read.streamId === currentStream);
+    assert.ok(index >= 0, "the current relay has a read awaiting its next batch");
+    return reads.splice(index, 1)[0]!;
+  };
   const deliverBatch = async (sessionId = current.id) => {
-    const read = reads.shift();
-    assert.ok(read, "one relay read is awaiting its next batch");
-    read.resolve({ content: [{ type: "text", text: "Simulator video batch." }], _meta: { "apple-device-hub/video": { sessionId, streamId: read.streamId, active: true, frames: [Buffer.from([0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x1f, 0xaa, 0, 0, 1, 0x68, 0xbb, 0, 0, 0, 1, 0x65, 0xcc]).toString("base64")] } } });
+    const read = takeRead();
+    const sequence = served.get(read.streamId) ?? 0;
+    served.set(read.streamId, sequence + 1);
+    read.resolve({ content: [{ type: "text", text: "Simulator video batch." }], _meta: { "apple-device-hub/video": { sessionId, streamId: read.streamId, sequence, active: true, frames: [Buffer.from([0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x1f, 0xaa, 0, 0, 1, 0x68, 0xbb, 0, 0, 0, 1, 0x65, 0xcc]).toString("base64")] } } });
     await flush();
   };
   const failStream = async () => {
     if (relay) {
-      const read = reads.shift();
-      assert.ok(read);
+      const read = takeRead();
       read.resolve({ isError: true, content: [{ type: "text", text: "Simulator display unavailable." }] });
     } else sockets.at(-1)!.onerror!();
     await flush();
@@ -261,6 +280,116 @@ for (const mode of ["websocket", "relay-preview", "relay-host", "hevc-capture-fa
     assert.ok(sockets.every(socket => socket.closes === 1));
     assert.ok(decoders.every(decoder => decoder.state === "closed"));
     if (relay) assert.equal(stops.length, streamNumber, "every relay is stopped exactly once");
+  } finally {
+    window.dispatchEvent(new Event("pagehide"));
+    for (const [name, descriptor] of previous) {
+      if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+      else delete (globalThis as unknown as Record<string, unknown>)[name];
+    }
+  }
+});
+
+test("live video keeps one read pending and streams touches and Home without Xcode", async () => {
+  const document = Object.assign(new EventTarget(), { hidden: false, documentElement: new ViewerNode() });
+  const window = Object.assign(new EventTarget(), { __APPLE_DEVICE_HUB_PREVIEW__: true, location: { search: "?transport=mcp" }, devicePixelRatio: 2 });
+  const [screen, canvas, frame, root, gesture, stage] = Array.from({ length: 6 }, () => new ViewerNode());
+  Object.assign(stage, { clientWidth: 400, clientHeight: 780 });
+  frame.parentElement = stage;
+  canvas.rect = { left: 100, top: 50, width: 200, height: 400 };
+  frame.rect = { left: 100, top: 50, width: 200, height: 400 };
+  const decoders: ViewerDecoder[] = [];
+  const reads: Array<{ resolve: (result: unknown) => void }> = [];
+  const inputs: Array<{ events: unknown[]; resolve: (result: unknown) => void }> = [];
+  const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+  const tool = async (name: string, args: Record<string, unknown>) => {
+    calls.push({ name, args });
+    if (name === "device_hub_status") return { content: [], structuredContent: { devices: [current.device], sessions: [current], warnings: [] } };
+    if (name === "device_capture") return captured("still");
+    if (name === "device_stream") return { content: [], structuredContent: { sessionId: current.id, streamId: "1".padStart(48, "0"), url: "ws://blocked", format: "h264", codec: "avc1.42E01F", fps: 60 } };
+    if (name === "device_stream_read") return new Promise(resolve => { reads.push({ resolve }); });
+    if (name === "device_input") return new Promise(resolve => { inputs.push({ events: args.events as unknown[], resolve }); });
+    if (name === "device_action") return captured("action-still");
+    if (name === "device_stream_stop") return { content: [], structuredContent: { stopped: true } };
+    throw new Error(`Unexpected tool ${name}`);
+  };
+  const batch = (sequence: number, unit: number[]) => ({ content: [], _meta: { "apple-device-hub/video": { sessionId: current.id, streamId: "1".padStart(48, "0"), sequence, active: true, frames: [Buffer.from(unit).toString("base64")] } } });
+  const replacements = {
+    document, window,
+    matchMedia: () => ({ matches: false }),
+    getComputedStyle: () => ({ maxHeight: "498px" }),
+    IntersectionObserver: class { observe() {} disconnect() {} },
+    VideoDecoder: class extends ViewerDecoder { static async isConfigSupported() { return { supported: false }; } constructor(callbacks: VideoDecoderInit) { super(callbacks); decoders.push(this); } },
+    EncodedVideoChunk: class { constructor(readonly init: EncodedVideoChunkInit) {} },
+    setTimeout: () => 0,
+    clearTimeout: () => {},
+    fetch: async (_url: string, init: RequestInit) => {
+      const { name, arguments: args } = JSON.parse(init.body as string) as { name: string; arguments: Record<string, unknown> };
+      const result = await tool(name, args);
+      return { ok: true, async json() { return result; } };
+    },
+  };
+  const previous = Object.keys(replacements).map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)] as const);
+  for (const [name, value] of Object.entries(replacements)) Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
+  const flush = async () => { for (let index = 0; index < 4; index++) await new Promise<void>(resolve => setImmediate(resolve)); };
+  const pointer = (type: string, clientX: number, clientY: number, timeStamp: number) => {
+    const event = Object.assign(new Event(type), { button: 0, pointerId: 7, clientX, clientY });
+    Object.defineProperty(event, "timeStamp", { value: timeStamp });
+    frame.dispatchEvent(event);
+  };
+  try {
+    const module = new URL("../src/viewer-controller.ts", import.meta.url);
+    module.searchParams.set("test", "live-input");
+    const viewer = await import(module.href) as typeof import("../src/viewer-controller.js");
+    await viewer.initializeViewer({ root: root as unknown as HTMLElement, screen: screen as unknown as HTMLImageElement, canvas: canvas as unknown as HTMLCanvasElement, frame: frame as unknown as HTMLElement, gesture: gesture as unknown as HTMLElement });
+    await flush();
+    assert.equal(calls.find(call => call.name === "device_stream")!.args.maxDimension, 1024, "video is sized to the frame's device pixels");
+    assert.equal(reads.length, 1, "one read is pending, leaving host request capacity for input");
+    reads[0]!.resolve(batch(0, [0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x1f, 0xaa, 0, 0, 1, 0x68, 0xbb, 0, 0, 0, 1, 0x65, 0xcc]));
+    await flush();
+    assert.equal(reads.length, 2, "the next read starts once a batch arrives");
+    reads[1]!.resolve(batch(1, [0, 0, 1, 0x41, 0xcc]));
+    await flush();
+    assert.deepEqual(decoders[0]!.chunks.map(chunk => chunk.init.type), ["key", "delta"]);
+    decoders[0]!.callbacks.output({ displayWidth: 402, displayHeight: 874, close() {} } as unknown as VideoFrame);
+    assert.equal(viewer.getSnapshot().liveInput, true);
+
+    pointer("pointerdown", 150, 150, 1000);
+    await flush();
+    assert.deepEqual(inputs.map(input => input.events), [[{ type: "down", x: 0.25, y: 0.25, dt: 0 }]]);
+    pointer("pointermove", 150, 170, 1016);
+    pointer("pointermove", 150, 190, 1033);
+    await flush();
+    assert.equal(inputs.length, 1, "moves wait while a batch is in flight");
+    inputs[0]!.resolve({ content: [], structuredContent: { delivered: 1 } });
+    await flush();
+    assert.deepEqual(inputs[1]!.events, [{ type: "move", x: 0.25, y: 0.3, dt: 16 }, { type: "move", x: 0.25, y: 0.35, dt: 17 }]);
+    pointer("pointerup", 150, 190, 1050);
+    inputs[1]!.resolve({ content: [], structuredContent: { delivered: 2 } });
+    await flush();
+    assert.deepEqual(inputs[2]!.events, [{ type: "up", x: 0.25, y: 0.35, dt: 17 }]);
+    inputs[2]!.resolve({ content: [], structuredContent: { delivered: 1 } });
+    await viewer.performAction({ type: "button", button: "home" });
+    await flush();
+    assert.equal(inputs[3]!.events.length, 1);
+    assert.equal((inputs[3]!.events[0] as { type: string }).type, "home");
+    assert.equal(calls.some(call => call.name === "device_action"), false, "live input never waits on Xcode");
+
+    // A failed live delivery falls back to Xcode input for the next gesture.
+    inputs[3]!.resolve({ isError: true, content: [{ type: "text", text: "Live input is unavailable: SimulatorKit is missing." }] });
+    await flush();
+    assert.equal(viewer.getSnapshot().liveInput, false);
+    assert.match(viewer.getSnapshot().notice, /SimulatorKit is missing\. Using Xcode input instead/);
+    pointer("pointerdown", 150, 150, 2000);
+    pointer("pointerup", 150, 150, 2050);
+    await flush();
+    assert.equal(inputs.length, 4);
+    assert.deepEqual(calls.find(call => call.name === "device_action")!.args.action, { type: "tap", x: 110, y: 239 });
+
+    // A skipped batch would corrupt the decoder's reference chain, so video reconnects instead.
+    reads[2]!.resolve(batch(3, [0, 0, 1, 0x41, 0xcc]));
+    await flush();
+    assert.equal(viewer.getSnapshot().videoReady, false);
+    assert.match(viewer.getSnapshot().videoMessage, /out of order/);
   } finally {
     window.dispatchEvent(new Event("pagehide"));
     for (const [name, descriptor] of previous) {

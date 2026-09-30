@@ -638,7 +638,7 @@ test('live stream reads run alongside input and prevent idle expiry while pendin
   assert.equal(f.calls.at(-1)?.args.interactionCommand, 'b h', 'input does not wait for a live batch');
   await new Promise(resolve => setTimeout(resolve, 45));
   assert.equal(f.calls.some(call => call.name === 'DeviceInteractionEndSession'), false);
-  const result: VideoBatch = { sessionId: session.id, streamId: 'live-stream', frames: [], active: true };
+  const result: VideoBatch = { sessionId: session.id, streamId: 'live-stream', sequence: 0, frames: [], active: true };
   release(result);
   assert.equal(await reading, result);
   await f.hub.streamStop(session.id, 'live-stream');
@@ -664,7 +664,7 @@ test('live stream reads guard simulator ownership and reject results after disco
   const reading = f.hub.streamRead(session.id, 'stream');
   const rejected = assert.rejects(reading, SessionExpiredError);
   await f.hub.disconnect(session.id);
-  release({ sessionId: session.id, streamId: 'stream', frames: [], active: true });
+  release({ sessionId: session.id, streamId: 'stream', sequence: 0, frames: [], active: true });
   await rejected;
   assert.equal(reads, 1);
   await assert.rejects(f.hub.streamStop(session.id, 'stream'), SessionExpiredError);
@@ -683,4 +683,30 @@ test('relay errors after device disconnect report session expiry to the viewer',
   await f.hub.disconnect(session.id);
   reject(new Error('Simulator video stream stopped.'));
   await rejected;
+});
+
+test('live input reaches the simulator helper without Xcode or the serial device queue', async (t) => {
+  const video = new SimulatorVideo();
+  const inputs: unknown[] = [];
+  video.input = (sessionId, events) => { inputs.push([sessionId, events]); };
+  const f = await fixture(t, 60_000, video);
+  const physical = await f.hub.connect('physical-1');
+  await assert.rejects(f.hub.input(physical.id, [{ type: 'home', dt: 0 }]), /supports Apple simulators/);
+  await assert.rejects(f.hub.input('missing-session', [{ type: 'home', dt: 0 }]), SessionExpiredError);
+  const session = await f.hub.connect('sim-1');
+  let release!: () => void;
+  let entered!: () => void;
+  const blocked = new Promise<void>(resolve => { entered = resolve; });
+  f.setToolHook(async name => {
+    if (name === 'DeviceInteractionSynthesize') { entered(); await new Promise<void>(resolve => { release = resolve; }); }
+    return undefined;
+  });
+  const observing = f.hub.capture(session.id);
+  await blocked;
+  const calls = f.calls.length;
+  await f.hub.input(session.id, [{ type: 'down', x: 0.5, y: 0.25, dt: 0 }]);
+  assert.deepEqual(inputs, [[session.id, [{ type: 'down', x: 0.5, y: 0.25, dt: 0 }]]], 'input is delivered while an observation is pending');
+  assert.equal(f.calls.length, calls);
+  release();
+  await observing;
 });

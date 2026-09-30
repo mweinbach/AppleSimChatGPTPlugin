@@ -1,13 +1,16 @@
 #import <Foundation/Foundation.h>
 #import <CoreImage/CoreImage.h>
+#import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <VideoToolbox/VideoToolbox.h>
 #import <IOSurface/IOSurface.h>
 #import <ImageIO/ImageIO.h>
 #import <objc/message.h>
+#import <mach/mach_time.h>
 #import <dlfcn.h>
 #import <poll.h>
 #import <signal.h>
+#import <stdatomic.h>
 #import <unistd.h>
 #import <fcntl.h>
 #import <errno.h>
@@ -19,9 +22,11 @@ static void stopSignal(int number) { stopping = 1; }
 
 static void diagnostic(NSDictionary *event) {
     NSData *data = [NSJSONSerialization dataWithJSONObject:event options:0 error:nil];
+    flockfile(stderr);
     fwrite(data.bytes, 1, data.length, stderr);
     fputc('\n', stderr);
     fflush(stderr);
+    funlockfile(stderr);
 }
 
 static void fail(NSString *message) {
@@ -32,6 +37,12 @@ static void fail(NSString *message) {
 
 static id objectMessage(id target, const char *selector) {
     return ((id(*)(id, SEL))objc_msgSend)(target, sel_registerName(selector));
+}
+
+static double milliseconds(uint64_t ticks) {
+    static mach_timebase_info_data_t timebase;
+    if (!timebase.denom) mach_timebase_info(&timebase);
+    return (double)ticks * timebase.numer / timebase.denom / 1e6;
 }
 
 static BOOL writeBytes(const void *bytes, size_t length) {
@@ -67,6 +78,38 @@ static NSString *developerDirectory(void) {
     return [selected stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
 }
 
+// SimulatorKit's Indigo HID packet layout, as sent by Simulator.app's digitizer.
+#pragma pack(push, 4)
+typedef struct { uint32_t bits, size, remotePort, localPort, voucherPort; int32_t identifier; } IndigoMachHeader;
+typedef struct { uint32_t field1, field2, field3; double xRatio, yRatio, field6, field7, field8; uint32_t field9, field10, field11, field12, field13; double field14, field15, field16, field17, field18; } IndigoTouch;
+typedef struct { uint32_t field1; uint64_t timestamp; uint32_t field3; IndigoTouch touch; } IndigoPayload;
+typedef struct { IndigoMachHeader header; uint32_t innerSize; uint8_t eventType; uint8_t reserved[3]; IndigoPayload payload; } IndigoMessage;
+#pragma pack(pop)
+typedef IndigoMessage *(*IndigoMouseFunction)(CGPoint *location, CGPoint *windowLocation, uint32_t target, NSUInteger eventType, CGSize displaySize, uint32_t edge);
+typedef IndigoMessage *(*IndigoHIDFunction)(uint32_t target, uint32_t page, uint32_t usage, uint32_t operation);
+static const uint32_t IndigoDigitizerTarget = 0x32;
+
+/** The simulator ignores the bare mouse packet; Simulator.app's digitizer sends it as two touch payloads. */
+static IndigoMessage *touchMessage(IndigoMouseFunction mouse, CGPoint point, CGSize size, BOOL down) {
+    IndigoMessage *base = mouse(&point, NULL, IndigoDigitizerTarget, down ? 1 : 2, size, 0);
+    if (!base) return NULL;
+    IndigoMessage *message = calloc(1, sizeof(IndigoMessage) + sizeof(IndigoPayload));
+    if (!message) { free(base); return NULL; }
+    message->innerSize = sizeof(IndigoPayload);
+    message->eventType = 2;
+    message->payload.field1 = 0x0b;
+    message->payload.timestamp = mach_absolute_time();
+    message->payload.touch = base->payload.touch;
+    message->payload.touch.xRatio = point.x;
+    message->payload.touch.yRatio = point.y;
+    IndigoPayload *contact = (IndigoPayload *)((uint8_t *)&message->payload + sizeof(IndigoPayload));
+    memcpy(contact, &message->payload, sizeof(IndigoPayload));
+    contact->touch.field1 = 1;
+    contact->touch.field2 = 2;
+    free(base);
+    return message;
+}
+
 @class SimulatorStream;
 static void compressedFrame(void *context, void *sourceContext, OSStatus status, VTEncodeInfoFlags flags, CMSampleBufferRef sample);
 
@@ -84,6 +127,7 @@ static void compressedFrame(void *context, void *sourceContext, OSStatus status,
     CIContext *imageContext;
     CGColorSpaceRef colorSpace;
     NSInteger maxDimension;
+    double maxFPS;
     uint32_t orientation;
     size_t encodedWidth;
     size_t encodedHeight;
@@ -96,16 +140,39 @@ static void compressedFrame(void *context, void *sourceContext, OSStatus status,
     CFAbsoluteTime startedAt;
     uint64_t submittedFrames;
     uint64_t emittedFrames;
+    // Damage-driven encoding state; owned by `queue`.
+    BOOL attached;
+    BOOL pendingFrame;
+    BOOL deferredFrame;
+    BOOL forceKeyFrame;
+    BOOL damagedSinceKeyFrame;
+    CFAbsoluteTime lastEncodedAt;
+    CFAbsoluteTime lastKeyFrameAt;
+    uint64_t keyFrames;
+    double encodeLatencyTotal;
+    double encodeLatencyMax;
+    // Live input state; owned by `inputQueue`.
+    dispatch_queue_t inputQueue;
+    id hidClient;
+    IndigoMouseFunction mouseMessage;
+    IndigoHIDFunction hidMessage;
+    BOOL touching;
+    CGPoint touchPoint;
+    _Atomic uint32_t touchOrientation;
+    _Atomic uint32_t surfaceWidth;
+    _Atomic uint32_t surfaceHeight;
 }
-- (BOOL)startWithUDID:(NSString *)udid developerDirectory:(NSString *)developer maxDimension:(NSInteger)maximum codecType:(CMVideoCodecType)type;
+- (BOOL)startWithUDID:(NSString *)udid developerDirectory:(NSString *)developer maxDimension:(NSInteger)maximum maxFPS:(double)fps codecType:(CMVideoCodecType)type;
 - (void)emitSample:(CMSampleBufferRef)sample status:(OSStatus)status;
+- (void)finishedFrameSubmittedAt:(uint64_t)submitted;
 - (void)stop;
 @end
 
 @implementation SimulatorStream
 
-- (BOOL)startWithUDID:(NSString *)udid developerDirectory:(NSString *)developer maxDimension:(NSInteger)maximum codecType:(CMVideoCodecType)type {
+- (BOOL)startWithUDID:(NSString *)udid developerDirectory:(NSString *)developer maxDimension:(NSInteger)maximum maxFPS:(double)fps codecType:(CMVideoCodecType)type {
     codecType = type;
+    maxFPS = fps;
     if (!dlopen("/Library/Developer/PrivateFrameworks/CoreSimulator.framework/CoreSimulator", RTLD_NOW | RTLD_GLOBAL)) {
         fail([NSString stringWithFormat:@"Cannot load CoreSimulator: %s", dlerror()]);
         return NO;
@@ -134,6 +201,7 @@ static void compressedFrame(void *context, void *sourceContext, OSStatus status,
     if (!screen || ![screen respondsToSelector:sel_registerName("registerScreenCallbacksWithUUID:callbackQueue:frameCallback:surfacesChangedCallback:propertiesChangedCallback:")]) {
         fail(@"CoreSimulator did not expose a live primary screen."); return NO;
     }
+    [self prepareInputWithDeveloperDirectory:developer];
     maxDimension = maximum;
     orientation = 1;
     imageContext = [CIContext contextWithOptions:@{ kCIContextCacheIntermediates: @NO }];
@@ -143,28 +211,76 @@ static void compressedFrame(void *context, void *sourceContext, OSStatus status,
     registration = [NSUUID UUID];
     startedAt = CFAbsoluteTimeGetCurrent();
     __weak SimulatorStream *weakSelf = self;
+    // The frame callback fires only when the simulator renders a changed frame.
     ((void(*)(id, SEL, id, id, id, id, id))objc_msgSend)(screen, sel_registerName("registerScreenCallbacksWithUUID:callbackQueue:frameCallback:surfacesChangedCallback:propertiesChangedCallback:"), registration, queue,
-        ^{},
+        ^{ [weakSelf receiveFrame]; },
         ^(id surface, id maskedSurface) { [weakSelf receiveSurface:(__bridge IOSurfaceRef)surface]; },
         ^(id properties) { [weakSelf receiveProperties:properties]; });
-    dispatch_sync(queue, ^{ [self receiveProperties:objectMessage(self->screen, "screenProperties")]; });
+    dispatch_sync(queue, ^{
+        [self receiveProperties:objectMessage(self->screen, "screenProperties")];
+        self->attached = YES;
+        self->forceKeyFrame = YES;
+        [self encodeLatestFrame];
+    });
+    // A static screen still refreshes once per second, keeping viewers' liveness checks satisfied.
     timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
-    dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, NSEC_PER_SEC / 30, NSEC_PER_MSEC);
-    dispatch_source_set_event_handler(timer, ^{ @autoreleasepool { [weakSelf encodeLatestFrame]; } });
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 4), NSEC_PER_SEC / 4, NSEC_PER_MSEC * 10);
+    dispatch_source_set_event_handler(timer, ^{ @autoreleasepool { [weakSelf idleRefresh]; } });
     dispatch_resume(timer);
-    diagnostic(@{@"event": @"attached", @"udid": udid, @"screenID": @(selectedID), @"fps": @30, @"format": codecType == kCMVideoCodecType_HEVC ? @"hevc-annex-b" : @"h264-annex-b", @"framing": @"uint32be-length"});
+    diagnostic(@{@"event": @"attached", @"udid": udid, @"screenID": @(selectedID), @"fps": @(maxFPS), @"format": codecType == kCMVideoCodecType_HEVC ? @"hevc-annex-b" : @"h264-annex-b", @"framing": @"uint32be-length"});
     return YES;
+}
+
+- (void)prepareInputWithDeveloperDirectory:(NSString *)developer {
+    inputQueue = dispatch_queue_create("apple-device-hub.simulator-input", DISPATCH_QUEUE_SERIAL);
+    NSArray<NSString *> *paths = @[
+        [[developer stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"SharedFrameworks/SimulatorKit.framework/SimulatorKit"],
+        [developer stringByAppendingPathComponent:@"Library/PrivateFrameworks/SimulatorKit.framework/SimulatorKit"],
+    ];
+    BOOL loaded = NO;
+    for (NSString *path in paths) if ((loaded = dlopen(path.fileSystemRepresentation, RTLD_NOW | RTLD_GLOBAL) != NULL)) break;
+    NSString *message = nil;
+    Class clientClass = NSClassFromString(@"SimulatorKit.SimDeviceLegacyHIDClient");
+    mouseMessage = (IndigoMouseFunction)dlsym(RTLD_DEFAULT, "IndigoHIDMessageForMouseNSEvent");
+    hidMessage = (IndigoHIDFunction)dlsym(RTLD_DEFAULT, "IndigoHIDMessageForHIDArbitrary");
+    if (!loaded) message = [NSString stringWithFormat:@"Cannot load SimulatorKit: %s", dlerror()];
+    else if (!clientClass || !mouseMessage || !hidMessage) message = @"SimulatorKit does not expose simulator touch input.";
+    else {
+        NSError *error = nil;
+        hidClient = ((id(*)(id, SEL, id, NSError **))objc_msgSend)([clientClass alloc], sel_registerName("initWithDevice:error:"), device, &error);
+        if (!hidClient) message = error.localizedDescription ?: @"Cannot connect simulator touch input.";
+    }
+    diagnostic(message ? @{@"event": @"input", @"available": @NO, @"message": message} : @{@"event": @"input", @"available": @YES});
 }
 
 - (void)receiveProperties:(id)properties {
     if ([properties respondsToSelector:sel_registerName("uiOrientation")]) orientation = ((uint32_t(*)(id, SEL))objc_msgSend)(properties, sel_registerName("uiOrientation"));
+    if (attached) { damagedSinceKeyFrame = YES; [self encodeLatestFrame]; }
 }
 
 - (void)receiveSurface:(IOSurfaceRef)surface {
     if (latestBuffer) { CVPixelBufferRelease(latestBuffer); latestBuffer = nil; }
     if (!surface || stopping) return;
     OSStatus status = CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, surface, (__bridge CFDictionaryRef)@{ (id)kCVPixelBufferMetalCompatibilityKey: @YES }, &latestBuffer);
-    if (status != kCVReturnSuccess) fail([NSString stringWithFormat:@"Cannot bind simulator IOSurface (%d).", status]);
+    if (status != kCVReturnSuccess) { fail([NSString stringWithFormat:@"Cannot bind simulator IOSurface (%d).", status]); return; }
+    atomic_store(&surfaceWidth, (uint32_t)IOSurfaceGetWidth(surface));
+    atomic_store(&surfaceHeight, (uint32_t)IOSurfaceGetHeight(surface));
+    if (attached) { forceKeyFrame = YES; [self encodeLatestFrame]; }
+}
+
+- (void)receiveFrame {
+    damagedSinceKeyFrame = YES;
+    [self encodeLatestFrame];
+}
+
+- (void)idleRefresh {
+    if (stopping) return;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (!latestBuffer) {
+        if (now - startedAt > 10) fail(@"Timed out waiting for a simulator IOSurface.");
+        return;
+    }
+    if (now - lastEncodedAt >= 1) [self encodeLatestFrame];
 }
 
 - (BOOL)configureEncoderWithWidth:(size_t)width height:(size_t)height {
@@ -177,7 +293,8 @@ static void compressedFrame(void *context, void *sourceContext, OSStatus status,
     NSDictionary *attributes = @{ (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA), (id)kCVPixelBufferWidthKey: @(width), (id)kCVPixelBufferHeightKey: @(height), (id)kCVPixelBufferIOSurfacePropertiesKey: @{}, (id)kCVPixelBufferMetalCompatibilityKey: @YES };
     OSStatus status = VTCompressionSessionCreate(kCFAllocatorDefault, (int32_t)width, (int32_t)height, hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264, (__bridge CFDictionaryRef)specification, (__bridge CFDictionaryRef)attributes, nil, compressedFrame, (__bridge void *)self, &compression);
     if (status) { fail([NSString stringWithFormat:@"Cannot create %@ encoder (%d).", hevc ? @"hardware HEVC" : @"H.264", status]); return NO; }
-    NSDictionary *properties = @{ (id)kVTCompressionPropertyKey_RealTime: @YES, (id)kVTCompressionPropertyKey_AllowFrameReordering: @NO, (id)kVTCompressionPropertyKey_ProfileLevel: (id)(hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_Baseline_AutoLevel), (id)kVTCompressionPropertyKey_ExpectedFrameRate: @30, (id)kVTCompressionPropertyKey_MaxKeyFrameInterval: @30, (id)kVTCompressionPropertyKey_MaxFrameDelayCount: @1, (id)kVTCompressionPropertyKey_AverageBitRate: @(hevc ? MAX(width * height * 1.8, 1200000) : MAX(width * height * 3, 2000000)) };
+    // Keyframes are requested explicitly (first frame, new viewers, and periodically while the screen changes).
+    NSDictionary *properties = @{ (id)kVTCompressionPropertyKey_RealTime: @YES, (id)kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality: @YES, (id)kVTCompressionPropertyKey_AllowFrameReordering: @NO, (id)kVTCompressionPropertyKey_ProfileLevel: (id)(hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_Baseline_AutoLevel), (id)kVTCompressionPropertyKey_ExpectedFrameRate: @(MIN(maxFPS, 60)), (id)kVTCompressionPropertyKey_MaxKeyFrameInterval: @600, (id)kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: @10, (id)kVTCompressionPropertyKey_MaxFrameDelayCount: @0, (id)kVTCompressionPropertyKey_AverageBitRate: @(hevc ? MAX(width * height * 2.4, 1600000) : MAX(width * height * 4, 2600000)) };
     status = VTSessionSetProperties(compression, (__bridge CFDictionaryRef)properties);
     if (!status) status = VTCompressionSessionPrepareToEncodeFrames(compression);
     if (status) { fail([NSString stringWithFormat:@"Cannot configure %@ encoder (%d).", hevc ? @"HEVC" : @"H.264", status]); return NO; }
@@ -185,16 +302,31 @@ static void compressedFrame(void *context, void *sourceContext, OSStatus status,
     hardwareAccelerated = VTSessionCopyProperty(compression, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, kCFAllocatorDefault, &accelerated) == noErr && accelerated == kCFBooleanTrue;
     if (accelerated) CFRelease(accelerated);
     encodedOrientation = orientation;
+    atomic_store(&touchOrientation, orientation);
+    forceKeyFrame = YES;
     return YES;
 }
 
 - (void)encodeLatestFrame {
-    if (stopping) return;
-    if (!latestBuffer) {
-        if (CFAbsoluteTimeGetCurrent() - startedAt > 10) fail(@"Timed out waiting for a simulator IOSurface.");
+    if (stopping || !latestBuffer || !attached) return;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    CFAbsoluteTime earliest = lastEncodedAt + 1.0 / maxFPS;
+    if (now < earliest) {
+        if (!deferredFrame) {
+            deferredFrame = YES;
+            __weak SimulatorStream *weakSelf = self;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((earliest - now) * NSEC_PER_SEC)), queue, ^{
+                SimulatorStream *strongSelf = weakSelf;
+                if (!strongSelf) return;
+                strongSelf->deferredFrame = NO;
+                [strongSelf encodeLatestFrame];
+            });
+        }
         return;
     }
-    if (dispatch_semaphore_wait(encoderPermit, DISPATCH_TIME_NOW)) return;
+    // Two frames may be in flight; a frame that arrives meanwhile is encoded when a permit returns.
+    if (dispatch_semaphore_wait(encoderPermit, DISPATCH_TIME_NOW)) { pendingFrame = YES; return; }
+    pendingFrame = NO;
     CIImage *image = [CIImage imageWithCVPixelBuffer:latestBuffer];
     CGImagePropertyOrientation rotation = kCGImagePropertyOrientationUp;
     if (orientation == 2) rotation = kCGImagePropertyOrientationDown;
@@ -206,21 +338,37 @@ static void compressedFrame(void *context, void *sourceContext, OSStatus status,
     size_t width = MAX(2, ((size_t)(extent.size.width * scale)) & ~(size_t)1);
     size_t height = MAX(2, ((size_t)(extent.size.height * scale)) & ~(size_t)1);
     if (!compression || encodedWidth != width || encodedHeight != height || encodedOrientation != orientation) {
-        if (![self configureEncoderWithWidth:width height:height]) { dispatch_semaphore_signal(encoderPermit); return; }
+        if (![self configureEncoderWithWidth:width height:height]) { [self releaseEncoderPermit]; return; }
     }
     sourceWidth = CVPixelBufferGetWidth(latestBuffer);
     sourceHeight = CVPixelBufferGetHeight(latestBuffer);
     CVPixelBufferRef ownedBuffer = nil;
     OSStatus status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, VTCompressionSessionGetPixelBufferPool(compression), &ownedBuffer);
-    if (status) { dispatch_semaphore_signal(encoderPermit); fail([NSString stringWithFormat:@"Cannot allocate video frame (%d).", status]); return; }
+    if (status) { [self releaseEncoderPermit]; fail([NSString stringWithFormat:@"Cannot allocate video frame (%d).", status]); return; }
     image = [image imageByApplyingTransform:CGAffineTransformMakeTranslation(-extent.origin.x, -extent.origin.y)];
     image = [image imageByApplyingTransform:CGAffineTransformMakeScale((CGFloat)width / extent.size.width, (CGFloat)height / extent.size.height)];
     [imageContext render:image toCVPixelBuffer:ownedBuffer bounds:CGRectMake(0, 0, width, height) colorSpace:colorSpace];
-    NSDictionary *frameProperties = submittedFrames % 30 == 0 ? @{ (id)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES } : nil;
-    CMTime time = CMTimeMake((int64_t)submittedFrames++, 30);
-    status = VTCompressionSessionEncodeFrame(compression, ownedBuffer, time, CMTimeMake(1, 30), (__bridge CFDictionaryRef)frameProperties, nil, nil);
+    BOOL keyFrame = forceKeyFrame || (damagedSinceKeyFrame && now - lastKeyFrameAt >= 2);
+    if (keyFrame) { forceKeyFrame = NO; damagedSinceKeyFrame = NO; lastKeyFrameAt = now; keyFrames++; }
+    lastEncodedAt = now;
+    NSDictionary *frameProperties = keyFrame ? @{ (id)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES } : nil;
+    submittedFrames++;
+    status = VTCompressionSessionEncodeFrame(compression, ownedBuffer, CMClockGetTime(CMClockGetHostTimeClock()), kCMTimeInvalid, (__bridge CFDictionaryRef)frameProperties, (void *)(uintptr_t)mach_absolute_time(), nil);
     CVPixelBufferRelease(ownedBuffer);
-    if (status) { dispatch_semaphore_signal(encoderPermit); fail([NSString stringWithFormat:@"Cannot encode video frame (%d).", status]); }
+    if (status) { [self releaseEncoderPermit]; fail([NSString stringWithFormat:@"Cannot encode video frame (%d).", status]); }
+}
+
+- (void)releaseEncoderPermit {
+    dispatch_semaphore_signal(encoderPermit);
+    if (queue) dispatch_async(queue, ^{ if (self->pendingFrame) [self encodeLatestFrame]; });
+}
+
+- (void)finishedFrameSubmittedAt:(uint64_t)submitted {
+    @synchronized (self) {
+        double latency = milliseconds(mach_absolute_time() - submitted);
+        encodeLatencyTotal += latency;
+        encodeLatencyMax = MAX(encodeLatencyMax, latency);
+    }
 }
 
 - (void)emitSample:(CMSampleBufferRef)sample status:(OSStatus)status {
@@ -228,7 +376,7 @@ static void compressedFrame(void *context, void *sourceContext, OSStatus status,
     // header and payload together when nonblocking stdout requires several writes.
     @synchronized (self) {
         @autoreleasepool {
-            if (status || !sample || stopping) { if (status && !stopping) fail([NSString stringWithFormat:@"Video encoder failed (%d).", status]); dispatch_semaphore_signal(encoderPermit); return; }
+            if (status || !sample || stopping) { if (status && !stopping) fail([NSString stringWithFormat:@"Video encoder failed (%d).", status]); [self releaseEncoderPermit]; return; }
             CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sample, NO);
             CFDictionaryRef attachment = attachments && CFArrayGetCount(attachments) ? CFArrayGetValueAtIndex(attachments, 0) : nil;
             BOOL keyframe = !attachment || CFDictionaryGetValue(attachment, kCMSampleAttachmentKey_NotSync) != kCFBooleanTrue;
@@ -240,7 +388,7 @@ static void compressedFrame(void *context, void *sourceContext, OSStatus status,
             BOOL hevc = CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_HEVC;
             OSStatus parameterStatus = hevc ? CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(format, 0, nil, nil, &parameterCount, &headerLength) : CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, 0, nil, nil, &parameterCount, &headerLength);
             if (parameterStatus || (headerLength != 1 && headerLength != 2 && headerLength != 4)) {
-                fail(@"Video frame has invalid codec parameters."); dispatch_semaphore_signal(encoderPermit); return;
+                fail(@"Video frame has invalid codec parameters."); [self releaseEncoderPermit]; return;
             }
             if (keyframe) {
                 for (size_t index = 0; index < parameterCount; index++) {
@@ -252,14 +400,14 @@ static void compressedFrame(void *context, void *sourceContext, OSStatus status,
                     [packet appendBytes:parameter length:length];
                     if (index == 0 && !codec && length >= 4) {
                         codec = hevc ? @"hevc" : [NSString stringWithFormat:@"avc1.%02X%02X%02X", parameter[1], parameter[2], parameter[3]];
-                        diagnostic(@{@"event": @"configuration", @"width": @(encodedWidth), @"height": @(encodedHeight), @"sourceWidth": @(sourceWidth), @"sourceHeight": @(sourceHeight), @"orientation": @(encodedOrientation), @"hardwareAccelerated": @(hardwareAccelerated), @"fps": @30, @"codec": codec, @"format": hevc ? @"hevc-annex-b" : @"h264-annex-b"});
+                        diagnostic(@{@"event": @"configuration", @"width": @(encodedWidth), @"height": @(encodedHeight), @"sourceWidth": @(sourceWidth), @"sourceHeight": @(sourceHeight), @"orientation": @(encodedOrientation), @"hardwareAccelerated": @(hardwareAccelerated), @"fps": @(maxFPS), @"codec": codec, @"format": hevc ? @"hevc-annex-b" : @"h264-annex-b"});
                     }
                 }
             }
             CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sample);
             size_t length = CMBlockBufferGetDataLength(block);
             NSMutableData *avcc = [NSMutableData dataWithLength:length];
-            if (CMBlockBufferCopyDataBytes(block, 0, length, avcc.mutableBytes)) { fail(@"Cannot read encoded video frame."); dispatch_semaphore_signal(encoderPermit); return; }
+            if (CMBlockBufferCopyDataBytes(block, 0, length, avcc.mutableBytes)) { fail(@"Cannot read encoded video frame."); [self releaseEncoderPermit]; return; }
             const uint8_t *bytes = avcc.bytes;
             size_t offset = 0;
             while (offset < length) {
@@ -276,35 +424,116 @@ static void compressedFrame(void *context, void *sourceContext, OSStatus status,
                 uint32_t recordLength = CFSwapInt32HostToBig((uint32_t)packet.length);
                 if (writeBytes(&recordLength, sizeof(recordLength)) && writeBytes(packet.bytes, packet.length)) emittedFrames++;
             }
-            dispatch_semaphore_signal(encoderPermit);
+            [self releaseEncoderPermit];
         }
     }
+}
+
+/** Coordinates are fractions of the latest encoded (upright) frame; HID expects the unrotated display surface. */
+- (CGPoint)surfacePointForX:(double)x y:(double)y {
+    x = fmin(1, fmax(0, x));
+    y = fmin(1, fmax(0, y));
+    switch (atomic_load(&touchOrientation)) {
+        case 2: return CGPointMake(1 - x, 1 - y);
+        case 3: return CGPointMake(y, 1 - x);
+        case 4: return CGPointMake(1 - y, x);
+        default: return CGPointMake(x, y);
+    }
+}
+
+- (void)sendHID:(IndigoMessage *)message {
+    if (!message) { diagnostic(@{@"event": @"input-error", @"message": @"SimulatorKit could not create an input event."}); return; }
+    dispatch_semaphore_t delivered = dispatch_semaphore_create(0);
+    __block NSError *failure = nil;
+    ((void(*)(id, SEL, void *, BOOL, dispatch_queue_t, id))objc_msgSend)(hidClient, sel_registerName("sendWithMessage:freeWhenDone:completionQueue:completion:"), message, YES, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(NSError *error) {
+        failure = error;
+        dispatch_semaphore_signal(delivered);
+    });
+    if (dispatch_semaphore_wait(delivered, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC))) diagnostic(@{@"event": @"input-error", @"message": @"Timed out delivering simulator input."});
+    else if (failure) diagnostic(@{@"event": @"input-error", @"message": failure.localizedDescription ?: @"The simulator rejected an input event."});
+}
+
+- (void)touchPhase:(char)phase x:(double)x y:(double)y {
+    BOOL down = phase == 'd' || phase == 'm';
+    if (!hidClient || (!down && !touching)) return;
+    CGPoint point = [self surfacePointForX:x y:y];
+    [self sendHID:touchMessage(mouseMessage, point, CGSizeMake(atomic_load(&surfaceWidth), atomic_load(&surfaceHeight)), down)];
+    touching = down;
+    touchPoint = point;
+}
+
+- (void)pressHome {
+    if (!hidClient) return;
+    // Consumer-control Menu is the simulator's Home button on Face ID and Touch ID devices.
+    [self sendHID:hidMessage(IndigoDigitizerTarget, 0x0c, 0x40, 1)];
+    usleep(40000);
+    [self sendHID:hidMessage(IndigoDigitizerTarget, 0x0c, 0x40, 2)];
+}
+
+- (void)command:(const char *)line {
+    char phase = 0;
+    double x = NAN, y = NAN;
+    if (!strcmp(line, "k")) {
+        dispatch_async(queue, ^{ self->forceKeyFrame = YES; [self encodeLatestFrame]; });
+    } else if (!strcmp(line, "home")) {
+        [self pressHome];
+    } else if (sscanf(line, "t %c %lf %lf", &phase, &x, &y) == 3 && phase && strchr("dmuc", phase) && isfinite(x) && isfinite(y)) {
+        [self touchPhase:phase x:x y:y];
+    } else {
+        diagnostic(@{@"event": @"input-error", @"message": @"Unknown simulator input command."});
+    }
+}
+
+/** Standard input carries newline-separated commands: `k`, `home`, and `t <d|m|u|c> <x> <y>`. */
+- (void)readCommands {
+    __weak SimulatorStream *weakSelf = self;
+    [NSThread detachNewThreadWithBlock:^{
+        char line[256];
+        while (!stopping && fgets(line, sizeof(line), stdin)) {
+            line[strcspn(line, "\r\n")] = 0;
+            SimulatorStream *strongSelf = weakSelf;
+            if (!strongSelf) return;
+            char *command = line;
+            dispatch_sync(strongSelf->inputQueue, ^{ if (!stopping) [strongSelf command:command]; });
+        }
+    }];
 }
 
 - (void)stop {
     stopping = 1;
     if (timer) { dispatch_source_cancel(timer); timer = nil; }
     if (screen && registration) ((void(*)(id, SEL, id))objc_msgSend)(screen, sel_registerName("unregisterScreenCallbacksWithUUID:"), registration);
+    // A finger left down would stay pressed in the simulator after this client disconnects.
+    if (inputQueue) dispatch_sync(inputQueue, ^{
+        if (self->touching && self->hidClient) [self sendHID:touchMessage(self->mouseMessage, self->touchPoint, CGSizeMake(atomic_load(&self->surfaceWidth), atomic_load(&self->surfaceHeight)), NO)];
+        self->touching = NO;
+        self->hidClient = nil;
+    });
     if (queue) dispatch_sync(queue, ^{
         if (self->compression) { VTCompressionSessionCompleteFrames(self->compression, kCMTimeInvalid); VTCompressionSessionInvalidate(self->compression); CFRelease(self->compression); self->compression = nil; }
         if (self->latestBuffer) { CVPixelBufferRelease(self->latestBuffer); self->latestBuffer = nil; }
     });
     if (colorSpace) { CGColorSpaceRelease(colorSpace); colorSpace = nil; }
-    diagnostic(@{@"event": @"stopped", @"frames": @(emittedFrames)});
+    @synchronized (self) {
+        diagnostic(@{@"event": @"stopped", @"frames": @(emittedFrames), @"keyFrames": @(keyFrames), @"encodeLatencyAverageMs": @(submittedFrames ? encodeLatencyTotal / submittedFrames : 0), @"encodeLatencyMaxMs": @(encodeLatencyMax)});
+    }
 }
 
 @end
 
 static void compressedFrame(void *context, void *sourceContext, OSStatus status, VTEncodeInfoFlags flags, CMSampleBufferRef sample) {
-    [(__bridge SimulatorStream *)context emitSample:sample status:status];
+    SimulatorStream *stream = (__bridge SimulatorStream *)context;
+    [stream finishedFrameSubmittedAt:(uint64_t)(uintptr_t)sourceContext];
+    [stream emitSample:sample status:status];
 }
 
 int main(int argc, char **argv) {
     @autoreleasepool {
-        if (argc < 2) { fprintf(stderr, "Usage: simulator-stream <UDID> [--codec hevc|h264] [--developer-dir <path>] [--max-dimension <pixels>]\n"); return 2; }
+        if (argc < 2) { fprintf(stderr, "Usage: simulator-stream <UDID> [--codec hevc|h264] [--developer-dir <path>] [--max-dimension <pixels>] [--max-fps <rate>]\n"); return 2; }
         NSString *udid = @(argv[1]);
         NSString *developer = developerDirectory();
         NSInteger maximum = 0;
+        double fps = 120;
         CMVideoCodecType codecType = kCMVideoCodecType_H264;
         for (int index = 2; index < argc; index++) {
             NSString *argument = @(argv[index]);
@@ -315,6 +544,7 @@ int main(int argc, char **argv) {
                 else if (![name isEqualToString:@"h264"]) { fail(@"Codec must be hevc or h264."); return 2; }
             }
             else if ([argument isEqualToString:@"--max-dimension"] && index + 1 < argc) { maximum = [@(argv[++index]) integerValue]; if (maximum < 2) { fail(@"Maximum dimension must be at least 2 pixels."); return 2; } }
+            else if ([argument isEqualToString:@"--max-fps"] && index + 1 < argc) { fps = [@(argv[++index]) doubleValue]; if (!(fps >= 1 && fps <= 240)) { fail(@"Maximum frame rate must be between 1 and 240."); return 2; } }
             else { fail([NSString stringWithFormat:@"Unknown or incomplete argument: %@", argument]); return 2; }
         }
         if (!developer.length) { fail(@"Select Xcode or pass --developer-dir before starting a live display."); return 1; }
@@ -327,7 +557,8 @@ int main(int argc, char **argv) {
         }
         SimulatorStream *stream = [SimulatorStream new];
         @try {
-            if ([stream startWithUDID:udid developerDirectory:developer maxDimension:maximum codecType:codecType]) {
+            if ([stream startWithUDID:udid developerDirectory:developer maxDimension:maximum maxFPS:fps codecType:codecType]) {
+                [stream readCommands];
                 while (!stopping) [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
             }
             [stream stop];

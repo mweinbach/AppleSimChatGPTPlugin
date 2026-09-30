@@ -7,8 +7,8 @@ import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { WebSocket, type RawData } from "ws";
 import { AppleHub, type AppleBoundary } from "../src/apple.js";
-import { AccessUnitReader, SimulatorVideo } from "../src/video.js";
-import { inspectVideoAccessUnit } from "../src/video-codec.js";
+import { AccessUnitReader, LiveInputPacer, SimulatorVideo } from "../src/video.js";
+import { declareH264DecodeOrder, inspectVideoAccessUnit } from "../src/video-codec.js";
 
 const accessUnit = Buffer.from([
   0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x1f,
@@ -190,6 +190,17 @@ test("HEVC and H.264 viewers keep independent encoders and codec-specific keyfra
   await fallbackExit;
 });
 
+test("H.264 keyframes reach viewers and relays with decode order declared in the SPS", async t => {
+  const native = Buffer.from("00000001" + "27420020ab40f0103cda" + "00000001" + "28ce3c80" + "00000001" + "65888421", "hex");
+  const f = fixture(t, `process.stdout.write(Buffer.from(${JSON.stringify([...packet(native)])})); setInterval(() => {}, 1000);`);
+  const declared = Buffer.from(declareH264DecodeOrder(native));
+  assert.notDeepEqual(declared, native);
+  const view = await viewer(t, (await f.video.stream("session-one", "simulator-one")).url);
+  assert.deepEqual((await view.firstFrame)[0], declared);
+  const relay = await f.video.stream("session-two", "simulator-two");
+  assert.deepEqual((await f.video.read("session-two", relay.streamId!)).frames, [declared.toString("base64")]);
+});
+
 test("viewers joining an existing encoder receive codec parameters and a keyframe before deltas", async t => {
   const delta = Buffer.from([0, 0, 0, 1, 0x41, 0xff]);
   const f = fixture(t, `
@@ -325,11 +336,13 @@ test("MCP video reads relay native H.264 in bounded batches and consume the capa
   const pending = f.video.read("session-one", stream.streamId);
   await assert.rejects(f.video.read("session-one", stream.streamId), /already in progress/);
   const batch = await pending;
+  const next = await f.video.read("session-one", stream.streamId);
   assert.equal(batch.active, true);
   assert.equal(batch.sessionId, "session-one");
   assert.equal(batch.streamId, stream.streamId);
+  assert.deepEqual([batch.sequence, next.sequence], [0, 1], "batches are numbered in the order they were served");
   assert.ok(batch.frames.length > 0 && batch.frames.length <= 30);
-  assert.ok(batch.frames.every(frame => Buffer.from(frame, "base64").equals(accessUnit)));
+  assert.ok([...batch.frames, ...next.frames].every(frame => Buffer.from(frame, "base64").equals(accessUnit)));
   assert.equal(f.children.length, 1);
   assert.equal(await rejected(stream.url), 403);
   await assert.rejects(f.video.read("session-two", stream.streamId), /another session/);
@@ -405,50 +418,148 @@ test("idle MCP relays expire, release native capture, and cannot reuse their con
   assert.equal(await rejected(stream.url), 403);
 });
 
+type TestRelay = { frames: Buffer[]; bytes: number; waitingForKey: boolean };
+function relayOf(video: SimulatorVideo, streamId: string) {
+  const relay = (Reflect.get(video, "relays") as Map<string, TestRelay>).get(streamId)!;
+  const deliver = Reflect.get(video, "deliver") as (relay: TestRelay, unit: Buffer, key: boolean) => void;
+  return { relay, deliver: (unit: Buffer) => { const info = inspectVideoAccessUnit(unit); deliver.call(video, relay, unit, info.keyFrame && info.hasParameterSets); } };
+}
+const singleFrame = `process.stdout.write(Buffer.from(${JSON.stringify([...packet(accessUnit)])})); setInterval(() => {}, 1000);`;
+
 test("MCP relay overflow discards dependent frames until a complete keyframe", async t => {
   const f = fixture(t);
   const stream = await f.video.stream("session-one", "simulator-one");
   await f.video.read("session-one", stream.streamId!);
-  const relay = (Reflect.get(f.video, "relays") as Map<string, { socket: WebSocket; frames: Buffer[]; bytes: number; waitingForKey: boolean }>).get(stream.streamId!)!;
+  const { relay, deliver } = relayOf(f.video, stream.streamId!);
   const delta = Buffer.alloc(700 * 1024, 0x55);
   Buffer.from([0, 0, 0, 1, 0x41]).copy(delta);
-  for (let index = 0; index < 4; index++) relay.socket.emit("message", delta, true);
+  for (let index = 0; index < 4; index++) deliver(delta);
   assert.equal(relay.waitingForKey, true);
   assert.equal(relay.frames.length, 0);
   assert.equal(relay.bytes, 0);
-  relay.socket.emit("message", accessUnit, true);
-  relay.socket.emit("message", delta, true);
+  deliver(accessUnit);
+  deliver(delta);
   assert.deepEqual(relay.frames, [accessUnit, delta]);
   assert.equal(relay.waitingForKey, false);
   assert.ok(relay.bytes <= 2 * 1024 * 1024);
-  for (let index = 0; index < 30; index++) relay.socket.emit("message", Buffer.from([0, 0, 0, 1, 0x41, 0x55]), true);
-  assert.equal(relay.frames.length, 0, "the one-GOP frame count bound also drops stale dependency chains");
+  for (let index = 0; index < 30; index++) deliver(Buffer.from([0, 0, 0, 1, 0x41, 0x55]));
+  assert.equal(relay.frames.length, 0, "a reader half a second behind skips to a fresh keyframe");
 });
 
 test("a keyframe larger than the MCP relay limit fails explicitly and releases capture", async t => {
-  const f = fixture(t);
+  const f = fixture(t, singleFrame);
   const stream = await f.video.stream("session-one", "simulator-one");
   await f.video.read("session-one", stream.streamId!);
-  const relay = (Reflect.get(f.video, "relays") as Map<string, { socket: WebSocket }>).get(stream.streamId!)!;
+  const { deliver } = relayOf(f.video, stream.streamId!);
   const pending = assert.rejects(f.video.read("session-one", stream.streamId!), /keyframe exceeds the relay buffer limit/);
   const exited = deadline(once(f.children[0]!, "exit"));
   const largeKeyframe = Buffer.alloc(2 * 1024 * 1024 + 1, 0x55);
   accessUnit.copy(largeKeyframe);
-  relay.socket.emit("message", largeKeyframe, true);
+  deliver(largeKeyframe);
   await Promise.all([pending, exited]);
   assert.equal((Reflect.get(f.video, "relays") as Map<string, unknown>).size, 0);
 });
 
+test("a pending MCP read returns as soon as the next frame arrives", async t => {
+  const f = fixture(t, singleFrame);
+  const stream = await f.video.stream("session-one", "simulator-one");
+  await f.video.read("session-one", stream.streamId!);
+  const { deliver } = relayOf(f.video, stream.streamId!);
+  const started = performance.now();
+  const reading = f.video.read("session-one", stream.streamId!);
+  const delta = Buffer.from([0, 0, 0, 1, 0x41, 0x55]);
+  setTimeout(() => deliver(delta), 20);
+  const batch = await reading;
+  assert.deepEqual(batch.frames, [delta.toString("base64")]);
+  assert.ok(performance.now() - started < 200, "frames are not held for the idle wait");
+});
+
+test("a relay joining a running encoder requests a keyframe instead of waiting for one", async t => {
+  const delta = Buffer.from([0, 0, 0, 1, 0x41, 0xff]);
+  // The fixture sends a keyframe first, then only deltas unless asked on stdin.
+  const f = fixture(t, `
+    const key = Buffer.from(${JSON.stringify([...packet(accessUnit)])});
+    const delta = Buffer.from(${JSON.stringify([...packet(delta)])});
+    process.stdout.write(key);
+    let requested = false;
+    process.stdin.on("data", data => { if (String(data).includes("k\\n")) requested = true; });
+    setInterval(() => { process.stdout.write(requested ? key : delta); requested = false; }, 20);
+  `);
+  const first = await viewer(t, (await f.video.stream("session-one", "simulator-one")).url);
+  assert.deepEqual((await first.firstFrame)[0], accessUnit);
+  await deadline(once(first.socket, "message"));
+  const relay = await f.video.stream("session-one", "simulator-one");
+  const batch = await f.video.read("session-one", relay.streamId!);
+  assert.deepEqual(batch.frames.map(frame => Buffer.from(frame, "base64")), [accessUnit]);
+  assert.equal(f.children.length, 1);
+});
+
+test("live input is paced into the running helper and reports unavailable input", async t => {
+  const f = fixture(t, `process.stderr.write(JSON.stringify({ event: "input", available: true }) + "\\n"); ${singleFrame}`);
+  assert.throws(() => f.video.input("session-one", [{ type: "home", dt: 0 }]), /needs running simulator video/);
+  const stream = await f.video.stream("session-one", "simulator-one");
+  await f.video.read("session-one", stream.streamId!);
+  const writes: string[] = [];
+  const stdin = f.children[0]!.stdin;
+  const write = stdin.write.bind(stdin) as (chunk: string) => boolean;
+  stdin.write = ((chunk: string) => { writes.push(chunk); return write(chunk); }) as typeof stdin.write;
+  f.video.input("session-one", [{ type: "down", x: 0.25, y: 0.5, dt: 0 }, { type: "move", x: 0.3, y: 0.55, dt: 10 }, { type: "up", x: 0.3, y: 0.55, dt: 10 }, { type: "home", dt: 0 }]);
+  assert.deepEqual(writes, ["t d 0.25000 0.50000\n"], "the first event is sent immediately");
+  await new Promise(resolve => setTimeout(resolve, 60));
+  assert.deepEqual(writes.join("").split("\n").filter(Boolean), ["t d 0.25000 0.50000", "t m 0.30000 0.55000", "t u 0.30000 0.55000", "home"]);
+  assert.ok(f.touched.includes("session-one"), "input keeps the session alive");
+
+  const unavailable = fixture(t, `process.stderr.write(JSON.stringify({ event: "input", available: false, message: "SimulatorKit is missing." }) + "\\n"); ${singleFrame}`);
+  const other = await unavailable.video.stream("session-two", "simulator-two");
+  await unavailable.video.read("session-two", other.streamId!);
+  // Diagnostics arrive on stderr independently of the first frame on stdout.
+  for (const end = performance.now() + 2000; ;) {
+    try { assert.throws(() => unavailable.video.input("session-two", [{ type: "home", dt: 0 }]), /Live input is unavailable: SimulatorKit is missing/); break; }
+    catch (error) { if (performance.now() > end) throw error; await new Promise(resolve => setTimeout(resolve, 10)); }
+  }
+});
+
+test("input pacing keeps event spacing while bounding the delay of a late batch", () => {
+  let now = 1000;
+  const lines: string[] = [];
+  const timers: Array<() => void> = [];
+  const originalSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = ((callback: () => void) => { timers.push(callback); return 0; }) as unknown as typeof setTimeout;
+  try {
+    const pacer = new LiveInputPacer(output => lines.push(...output.trim().split("\n")), () => now);
+    const drainAt = (time: number) => { now = time; timers.splice(0).forEach(callback => callback()); };
+    pacer.push([{ type: "down", x: 0.5, y: 0.5, dt: 0 }]);
+    assert.deepEqual(lines, ["t d 0.50000 0.50000"]);
+    // A batch that arrives 40 ms late keeps its 16 ms spacing.
+    now = 1040;
+    pacer.push([{ type: "move", x: 0.5, y: 0.4, dt: 16 }, { type: "move", x: 0.5, y: 0.3, dt: 16 }, { type: "up", x: 0.5, y: 0.3, dt: 16 }]);
+    assert.equal(lines.length, 2);
+    drainAt(1056);
+    assert.equal(lines.length, 3);
+    drainAt(1072);
+    assert.deepEqual(lines.slice(3), ["t u 0.50000 0.30000"]);
+    // A batch spanning far longer than the lag bound compresses into it.
+    now = 5000;
+    pacer.push(Array.from({ length: 10 }, (_, index) => ({ type: "move" as const, x: index / 10, y: 0.5, dt: 100 })));
+    drainAt(5050);
+    assert.equal(lines.length, 14);
+    assert.equal(timers.length, 0);
+    pacer.close();
+  } finally { globalThis.setTimeout = originalSetTimeout; }
+});
+
 test("session and hub shutdown end pending MCP reads and release every relay", async t => {
-  const f = fixture(t);
+  const f = fixture(t, singleFrame);
   const first = await f.video.stream("session-one", "simulator-one");
   const second = await f.video.stream("session-two", "simulator-two");
-  await Promise.all([f.video.read("session-one", first.streamId!), f.video.read("session-two", second.streamId!)]);
+  const batches = await Promise.all([f.video.read("session-one", first.streamId!), f.video.read("session-two", second.streamId!)]);
+  assert.ok(batches.every(batch => batch.frames.length === 1));
   const firstRead = assert.rejects(f.video.read("session-one", first.streamId!), /stream stopped/);
+  const unaffected = f.video.read("session-two", second.streamId!);
   const firstExit = deadline(once(f.children[0]!, "exit"));
   f.video.closeSession("session-one");
   await Promise.all([firstRead, firstExit]);
-  assert.ok((await f.video.read("session-two", second.streamId!)).frames.length);
+  assert.deepEqual((await unaffected).frames, [], "another session's read completes normally");
   const secondRead = assert.rejects(f.video.read("session-two", second.streamId!), /stream stopped/);
   const secondExit = deadline(once(f.children[1]!, "exit"));
   await f.video.close();

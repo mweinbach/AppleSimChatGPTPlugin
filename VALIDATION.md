@@ -285,3 +285,68 @@ publisher identity, final public terms, and OpenAI's local-MCP distribution
 decision remain separate requirements in the
 [submission packet](docs/gallery/SUBMISSION.md). No gallery submission or
 publication was performed.
+
+## 60 fps video and live simulator input — September 30, 2026
+
+Unreleased source after v0.1.3. Measured on the booted **iPhone 18 Pro, iOS 27.2**,
+`39040C56-852A-47E1-8327-49AE26DFDF80`, with Xcode 27.2 (`27B5019j`) and headless
+Google Chrome **154.0.8037.58**. Before this change the helper sampled a fixed
+30 fps timer, each relay read waited 150 ms, and viewer input went through Xcode
+as one tap or swipe after pointer release.
+
+CoreSimulator's frame callback fires only when the simulator renders a changed
+frame: none on a static Home screen, and a median interval of **16.6 ms** (p95
+19.1 ms) during a sustained drag. SimulatorKit's `SimDeviceLegacyHIDClient`
+accepted Indigo touch packets in **0.06 ms** on average, and the first changed
+pixels followed about **65 ms** after the first touch. The HID Home button
+returned from Settings to the Home screen. `scripts/interaction-benchmark.mjs`
+drove a 2.8-second HID drag through the helper's own input channel:
+
+| Codec | Encoded size | fps | Interval p50 / p95 | Bandwidth | Touch → frame |
+| --- | --- | --- | --- | --- | --- |
+| HEVC | 1206 × 2622 | 61.7 | 16.4 / 20.9 ms | 17.8 Mbps | 65–80 ms |
+| H.264 | 1206 × 2622 | 62.9 | 16.2 / 21.1 ms | 28.9 Mbps | 78–91 ms |
+| HEVC | 706 × 1536 | 62.6–62.9 | 16.3 / 18.8–19.9 ms | 6.8–7.1 Mbps | 46–65 ms |
+| H.264 | 706 × 1536 | 62.3 | 16.1 / 21.0 ms | 12.5 Mbps | 57–82 ms |
+
+Average encode latency was 4–6 ms at 706 × 1536 and 9–11 ms at full resolution.
+A static screen produced one keyframe and one refresh per second.
+
+The built viewer ran in Chrome through the preview's `?transport=mcp` relay, the
+same tool-call path as the embedded host. Its canvas displayed 229 × 498 CSS
+pixels at 2× and requested **470 × 1024** video. Playwright pointer events drove
+five short drags, a 300-step drag at about 120 Hz, and the Home button:
+
+| Codec | Drag fps (5 s window) | Touch → drawn frame | `device_input` round trip | Relay bandwidth | Home → first frame |
+| --- | --- | --- | --- | --- | --- |
+| HEVC | 56.9 | 77–93 ms | 1.5 ms average | 6.8 Mbps | 239 ms |
+| H.264 | 57.3 | 81–84 ms | 1.6 ms average | 10.6 Mbps | 418 ms |
+
+The drag window includes the gesture's start and the automation's own load on the
+page. With the same drag sent from Node through `device_input`, the viewer drew
+**61.1–61.7 fps** with interval p50 16.3–16.6 ms and p95 19.4–20.6 ms, matching
+the helper's own spacing.
+
+Chrome's hardware H.264 decoder held **9–10 frames** of VideoToolbox's Baseline
+stream, whose SPS has no VUI, and released them in bursts at keyframes. With the
+server's `declareH264DecodeOrder` rewrite it held **none**, and all 118 decoded
+pictures hashed identically to the original stream. Software decoding held no
+frames either way. After the rewrite every H.264 frame was drawn 2–4 ms after its
+batch arrived. Homebrew FFmpeg could not start on this Mac (missing
+`libx265.216.dylib`), so this decode check used WebCodecs.
+
+In landscape Safari, video restarted once at 1920 × 882 after rotation. A live tap
+at frame fraction (0.500, 0.966) opened iana.org's “Learn more” link, and a tap at
+(0.108, 0.080) pressed Back and returned to example.com, confirming both axes of
+the rotated touch mapping. The simulator was returned to portrait and Home.
+
+The installed host, ChatGPT **26.928.20755** (`com.openai.codex`), was inspected
+rather than run. Its MCP app bridge dispatches each iframe request asynchronously.
+Its app-server scheduler admits at most three non-critical requests per MCP app
+in a conversation, four per conversation, five across the app, and eight in
+total; app tool calls run as `interactive`. The viewer therefore keeps one video
+read pending, leaving capacity for live input and accessibility observations.
+
+The source suite passed **127 tests**. Typecheck, build, pack, and
+`verify:packages` passed with **20 tools**. Rendering in the ChatGPT host still
+needs a plugin reinstall and a new chat, and was not performed here.

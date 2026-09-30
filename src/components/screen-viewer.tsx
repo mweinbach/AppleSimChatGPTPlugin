@@ -20,7 +20,7 @@ const ScreenSurface = memo(function ScreenSurface({ state, highlight, inspecting
   }, []);
   const bounds = state.capture?.coordinateSpace;
   const rect = highlight && bounds && mappingReady ? screenElementRect(highlight.frame, bounds) : undefined;
-  return <div id="screen-frame" className="screen-frame" data-inspecting={inspecting} data-busy={state.busy} ref={frame} hidden>
+  return <div id="screen-frame" className="screen-frame" data-inspecting={inspecting} data-busy={state.busy && !state.liveInput} ref={frame} hidden>
     <img id="screen" ref={screen} alt="Connected Apple device screen" draggable={false} />
     <canvas id="screen-video" ref={canvas} aria-label="Live simulator screen" hidden />
     {rect && <div className="element-highlight" data-testid="element-highlight" style={{ left: `${rect.x}%`, top: `${rect.y}%`, width: `${rect.width}%`, height: `${rect.height}%` }} aria-hidden="true" />}
@@ -43,7 +43,7 @@ export function ScreenViewer({ state, highlight, inspecting, onInspect, mappingR
       {!showScreen && <Empty className="screen-empty"><EmptyHeader><EmptyMedia variant="icon">{state.session ? <LoaderCircle className="animate-spin" /> : <Smartphone />}</EmptyMedia><EmptyTitle>{state.session ? "Opening device…" : "Choose a device"}</EmptyTitle><EmptyDescription>{state.session ? "The first screen will appear here." : "Connect to view its screen and control it here."}</EmptyDescription></EmptyHeader></Empty>}
       <ScreenSurface state={state} highlight={highlight} inspecting={inspecting} mappingReady={mappingReady} />
     </div>
-    <div className="screen-caption"><span id="gesture-help">{!mappingReady && showScreen ? "Updating screen orientation…" : inspecting ? "Click an element on the screen to inspect it" : "Click to tap · drag to swipe"}</span><span className="screen-metadata"><span id="screen-dimensions">{state.capture && `${state.capture.coordinateSpace.width} × ${state.capture.coordinateSpace.height} pt`}</span>{!state.videoError && state.session?.device.kind === "simulator" && <span id="video-status" role="status">{state.videoMessage}</span>}</span></div>
+    <div className="screen-caption"><span id="gesture-help">{inspecting && mappingReady ? "Click an element on the screen to inspect it" : state.liveInput && !inspecting ? "Live touch · click or drag the screen" : !mappingReady && showScreen ? "Updating screen orientation…" : "Click to tap · drag to swipe"}</span><span className="screen-metadata"><span id="screen-dimensions">{state.capture && `${state.capture.coordinateSpace.width} × ${state.capture.coordinateSpace.height} pt`}</span>{!state.videoError && state.session?.device.kind === "simulator" && <span id="video-status" role="status">{state.videoMessage}</span>}</span></div>
     {state.videoError && <div id="video-status-row" className="video-status-row" data-error><span role="status">{state.videoMessage}</span><Button id="retry-video" variant="link" size="xs" onClick={retryVideo}>Retry video</Button></div>}
     <div className="device-toolbar" aria-label="Device controls">
       <Button id="home" variant="ghost" disabled={disabled} onClick={() => void performAction({ type: "button", button: "home" })}><Home data-icon="inline-start" /><span>Home</span></Button>

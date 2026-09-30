@@ -17,9 +17,10 @@ function fakeHub(): { hub: Hub; calls: unknown[] } {
     async connect(id) { calls.push(["connect", id]); return session; },
     async capture(id, options) { calls.push(["capture", id, options]); return frame(options?.accessibilityEnabled ?? true); },
     async frame(id) { calls.push(["frame", id]); return { ...frame(false), screenshot: { mimeType: "image/jpeg", data: "frame-base64", width: 644, height: 1400 } }; },
-    async stream(id, format = "h264") { calls.push(["stream", id, format]); return { sessionId: id, url: "ws://127.0.0.1:5555/video/test", format, codec: format === "hevc" ? "hev1.1.6.L150.B0" : "avc1.42E01F", fps: 30 }; },
-    async streamRead(id, streamId) { calls.push(["streamRead", id, streamId]); return { sessionId: id, streamId, frames: ["encoded-video-frame"], active: true }; },
+    async stream(id, format = "h264", maxDimension) { calls.push(["stream", id, format, ...(maxDimension ? [maxDimension] : [])]); return { sessionId: id, url: "ws://127.0.0.1:5555/video/test", format, codec: format === "hevc" ? "hev1.1.6.L150.B0" : "avc1.42E01F", fps: 60 }; },
+    async streamRead(id, streamId) { calls.push(["streamRead", id, streamId]); return { sessionId: id, streamId, sequence: 0, frames: ["encoded-video-frame"], active: true }; },
     async streamStop(id, streamId) { calls.push(["streamStop", id, streamId]); },
+    async input(id, events) { calls.push(["input", id, events]); },
     async action(id, action, options) { calls.push(["action", id, action, options]); return frame(); },
     async settings(id, settings) { calls.push(["settings", id, settings]); return frame(); },
     async disconnect(id) { calls.push(["disconnect", id]); },
@@ -40,7 +41,21 @@ test("video requests validate and route HEVC while older requests retain H.264",
   assert.equal((await callHubTool(hub, "device_stream", { sessionId: session.id, codec: "hevc" })).structuredContent?.format, "hevc");
   assert.equal((await callHubTool(hub, "device_stream", { sessionId: session.id })).structuredContent?.format, "h264");
   assert.equal((await callHubTool(hub, "device_stream", { sessionId: session.id, codec: "unknown" })).isError, true);
-  assert.deepEqual(calls, [["stream", session.id, "hevc"], ["stream", session.id, "h264"]]);
+  await callHubTool(hub, "device_stream", { sessionId: session.id, codec: "hevc", maxDimension: 1600 });
+  assert.equal((await callHubTool(hub, "device_stream", { sessionId: session.id, maxDimension: 12 })).isError, true);
+  assert.deepEqual(calls, [["stream", session.id, "hevc"], ["stream", session.id, "h264"], ["stream", session.id, "hevc", 1600]]);
+});
+
+test("live input accepts bounded touch and Home events in frame fractions only", async () => {
+  const { hub, calls } = fakeHub();
+  const events = [{ type: "down", x: 0.25, y: 0.5 }, { type: "move", x: 0.3, y: 0.5, dt: 16 }, { type: "up", x: 0.3, y: 0.5, dt: 16 }, { type: "home" }];
+  assert.deepEqual((await callHubTool(hub, "device_input", { sessionId: session.id, events })).structuredContent, { delivered: 4 });
+  assert.deepEqual(calls, [["input", session.id, events.map(event => ({ dt: 0, ...event }))]]);
+  calls.length = 0;
+  for (const invalid of [[], [{ type: "down", x: 1.5, y: 0.5 }], [{ type: "move", x: 0.5 }], [{ type: "home", dt: 5000 }], [{ type: "shell", command: "ls" }], Array.from({ length: 65 }, () => ({ type: "home" }))]) {
+    assert.equal((await callHubTool(hub, "device_input", { sessionId: session.id, events: invalid })).isError, true);
+  }
+  assert.deepEqual(calls, []);
 });
 
 test("model text lists elements while the raw hierarchy travels only in _meta for the viewer", () => {
@@ -92,7 +107,7 @@ test("embedded native video batches stay in app metadata and stop is scoped", as
   const { hub, calls } = fakeHub();
   const streamId = "a".repeat(48);
   const result = await callHubTool(hub, "device_stream_read", { sessionId: session.id, streamId });
-  assert.deepEqual(result._meta?.["apple-device-hub/video"], { sessionId: session.id, streamId, frames: ["encoded-video-frame"], active: true });
+  assert.deepEqual(result._meta?.["apple-device-hub/video"], { sessionId: session.id, streamId, sequence: 0, frames: ["encoded-video-frame"], active: true });
   assert.equal(JSON.stringify(result.content).includes("encoded-video-frame"), false);
   assert.equal(result.structuredContent, undefined);
   assert.equal((await callHubTool(hub, "device_stream_stop", { sessionId: session.id, streamId })).isError, undefined);
@@ -160,11 +175,11 @@ test("MCP discovery advertises native host entrypoints and opening accepts empty
     const streaming = tools.find(tool => tool.name === "device_frame")!;
     assert.deepEqual((streaming._meta?.ui as Record<string, unknown>).visibility, ["app"]);
     assert.deepEqual((tools.find(tool => tool.name === "device_stream")!._meta?.ui as Record<string, unknown>).visibility, ["app"]);
-    for (const name of ["device_stream_read", "device_stream_stop"]) {
+    for (const name of ["device_stream_read", "device_stream_stop", "device_input"]) {
       assert.deepEqual((tools.find(tool => tool.name === name)!._meta?.ui as Record<string, unknown>).visibility, ["app"]);
     }
-    const destructive = new Set(["device_action", "device_settings", "device_disconnect", "device_stream_stop", "simulator_click", "simulator_drag", "simulator_type_text", "simulator_press_key"]);
-    const openWorld = new Set(["device_action", "simulator_click", "simulator_drag", "simulator_type_text", "simulator_press_key"]);
+    const destructive = new Set(["device_action", "device_settings", "device_disconnect", "device_stream_stop", "device_input", "simulator_click", "simulator_drag", "simulator_type_text", "simulator_press_key"]);
+    const openWorld = new Set(["device_action", "device_input", "simulator_click", "simulator_drag", "simulator_type_text", "simulator_press_key"]);
     for (const tool of tools) {
       assert.equal(tool.annotations?.destructiveHint, destructive.has(tool.name), `${tool.name} reports destructive effects`);
       assert.equal(tool.annotations?.openWorldHint, openWorld.has(tool.name), `${tool.name} reports arbitrary app destinations`);

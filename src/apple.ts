@@ -8,7 +8,7 @@ import { promisify } from 'node:util';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { resolveElement, summarizeHierarchy, type Rect, type ScreenElement } from './elements.js';
-import { actionSchema, settingsSchema, textSizeSchema, type Capture, type Device, type DeviceAction, type DeviceSettings, type ElementTarget, type HubState, type Session } from './shared.js';
+import { actionSchema, settingsSchema, textSizeSchema, type Capture, type Device, type DeviceAction, type DeviceSettings, type ElementTarget, type HubState, type LiveInput, type Session } from './shared.js';
 import { SimulatorVideo, type VideoBatch, type VideoStream } from './video.js';
 
 export interface AppleBoundary {
@@ -292,9 +292,9 @@ export class AppleHub {
     return session;
   }
 
-  async stream(sessionId: string, format: "hevc" | "h264" = "h264"): Promise<VideoStream> {
+  async stream(sessionId: string, format: "hevc" | "h264" = "h264", maxDimension?: number): Promise<VideoStream> {
     const session = this.videoSession(sessionId);
-    const stream = await this.video.stream(sessionId, session.public.device.id, format);
+    const stream = await this.video.stream(sessionId, session.public.device.id, format, maxDimension);
     if (session.closing || this.closed) {
       this.video.closeSession(sessionId);
       throw new SessionExpiredError();
@@ -326,6 +326,12 @@ export class AppleHub {
   async streamStop(sessionId: string, streamId: string): Promise<void> {
     this.videoSession(sessionId);
     this.video.stop(sessionId, streamId);
+  }
+
+  /** Live viewer input bypasses the serial device queue, so it never waits behind an observation. */
+  async input(sessionId: string, events: LiveInput[]): Promise<void> {
+    this.videoSession(sessionId);
+    this.video.input(sessionId, events);
   }
 
   private keepVideoSessionAlive(sessionId: string) {

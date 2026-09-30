@@ -82,6 +82,15 @@ export const actionSchema = z.discriminatedUnion("type", [
 ]);
 export type DeviceAction = z.infer<typeof actionSchema>;
 
+const fraction = z.number().finite().min(0).max(1);
+const elapsed = z.number().finite().min(0).max(1000).default(0).describe("Milliseconds since the previous live input event");
+/** Live simulator input; x and y are fractions of the displayed video frame. */
+export const liveInputSchema = z.union([
+  z.object({ type: z.enum(["down", "move", "up", "cancel"]), x: fraction, y: fraction, dt: elapsed }),
+  z.object({ type: z.literal("home"), dt: elapsed }),
+]);
+export type LiveInput = z.infer<typeof liveInputSchema>;
+
 export const textSizeSchema = z.enum(["extra-small", "small", "medium", "large", "extra-large", "extra-extra-large", "extra-extra-extra-large", "accessibility-medium", "accessibility-large", "accessibility-extra-large", "accessibility-extra-extra-large", "accessibility-extra-extra-extra-large"]);
 export const settingsSchema = z.object({
   appearance: z.enum(["light", "dark"]).optional(),

@@ -2,7 +2,7 @@ import { App } from "@modelcontextprotocol/ext-apps";
 import { version } from "./version.js";
 import { applyDocumentTheme, applyHostStyleVariables } from "@modelcontextprotocol/ext-apps/app-with-deps";
 import { OpenAIExtensions, OPENAI_MODEL_CONTEXT_KEY } from "@openai/mcp-extensions/app";
-import { HIERARCHY_META_KEY, sessionSchema, type CaptureState, type DeviceAction, type DeviceSettings, type HubState, type Session } from "./shared.js";
+import { HIERARCHY_META_KEY, sessionSchema, type CaptureState, type DeviceAction, type DeviceSettings, type HubState, type LiveInput, type Session } from "./shared.js";
 import { screenToDevicePoint } from "./screen-mapping.js";
 import { coordinateSpaceMatchesFrame, SimulatorVideoPlayer, type SimulatorStream, type SimulatorVideoTransport } from "./video-player.js";
 import { preferredVideoCodec, type VideoCodec } from "./video-codec.js";
@@ -46,6 +46,8 @@ let lastVideoError = "";
 let videoRetryTimer: ReturnType<typeof setTimeout> | undefined;
 let videoObservationTimer: ReturnType<typeof setTimeout> | undefined;
 let videoDimensions: { width: number; height: number } | undefined;
+let videoRequestedDimension: number | undefined;
+let videoSizeFloor: number | undefined;
 let coordinateRefreshPending = false;
 let lastCoordinateRefresh = 0;
 let disconnecting = false;
@@ -62,6 +64,14 @@ const retiredSessionIds = new Set<string>();
 let attachedAt: string | undefined;
 let observedSettings: DeviceSettings = {};
 let pointerStart: { id: number; x: number; y: number; clientX: number; clientY: number; time: number; epoch: number; width: number; height: number } | undefined;
+// Live input streams touches to the simulator while the pointer moves; Xcode input remains the fallback.
+let liveTouch: { id: number; epoch: number; point: { x: number; y: number } } | undefined;
+let liveQueue: LiveInput[] = [];
+let liveSending = false;
+let liveInputAt: number | undefined;
+let liveInputError: string | undefined;
+let renderedAt: number[] = [];
+let fpsLabelAt = 0;
 
 export interface ViewerState {
   hub: HubState;
@@ -73,6 +83,8 @@ export interface ViewerState {
   ended: boolean;
   liveEnabled: boolean;
   videoReady: boolean;
+  /** Touches and Home go straight to the simulator instead of through Xcode. */
+  liveInput: boolean;
   videoDimensions?: { width: number; height: number };
   videoMessage: string;
   videoError: boolean;
@@ -84,7 +96,7 @@ export interface ViewerState {
   attached: boolean;
 }
 let snapshot: ViewerState = {
-  hub, selectedDeviceId, initialized, busy, ended, liveEnabled, videoReady,
+  hub, selectedDeviceId, initialized, busy, ended, liveEnabled, videoReady, liveInput: false,
   videoMessage: "", videoError: false,
   notice: "Connecting to Device Hub…", noticeError: false,
   settings: {}, contextEnabled, attachmentStatus: "Attach a screen to your next message.", attached: false,
@@ -94,7 +106,7 @@ export const subscribe = (listener: () => void) => { listeners.add(listener); re
 export const getSnapshot = () => snapshot;
 
 function publish(patch: Partial<ViewerState> = {}) {
-  snapshot = { ...snapshot, hub, session, capture, selectedDeviceId, initialized, busy, ended, liveEnabled, videoReady, videoDimensions, settings: observedSettings, contextEnabled, ...patch };
+  snapshot = { ...snapshot, hub, session, capture, selectedDeviceId, initialized, busy, ended, liveEnabled, videoReady, liveInput: liveInputReady(), videoDimensions, settings: observedSettings, contextEnabled, ...patch };
   listeners.forEach(listener => listener());
 }
 
@@ -158,6 +170,12 @@ function stopVideo(reset = false) {
   videoCanvas.hidden = true;
   videoReady = false;
   videoDimensions = undefined;
+  videoRequestedDimension = undefined;
+  renderedAt = [];
+  // The helper lifts a held touch when its video stops.
+  if (liveTouch) gestureMark.hidden = true;
+  liveTouch = undefined;
+  liveQueue = [];
   screenFrame.hidden = !capture;
   if (videoRetryTimer !== undefined) clearTimeout(videoRetryTimer);
   if (videoObservationTimer !== undefined) clearTimeout(videoObservationTimer);
@@ -166,22 +184,23 @@ function stopVideo(reset = false) {
     videoFailures = 0;
     lastVideoError = "";
     lastCoordinateRefresh = 0;
+    videoSizeFloor = undefined;
   }
   publish();
 }
 
-function scheduleVideoObservation() {
+function scheduleVideoObservation(delay = 5000) {
   if (videoObservationTimer !== undefined) clearTimeout(videoObservationTimer);
   videoObservationTimer = undefined;
   if (!canStreamVideo() || !videoPlayer || !session?.accessibilityEnabled) return;
   videoObservationTimer = setTimeout(() => {
     videoObservationTimer = undefined;
-    if (busy || pointerStart || settingsOpen) { scheduleVideoObservation(); return; }
+    if (busy || pointerStart || liveTouch || settingsOpen) { scheduleVideoObservation(); return; }
     const epoch = lifecycle;
     void captureCurrent(epoch).catch(error => {
       if (epoch === lifecycle && !ended) showNotice(errorMessage(error), true);
-    }).finally(scheduleVideoObservation);
-  }, 5000);
+    }).finally(() => scheduleVideoObservation());
+  }, delay);
 }
 
 function refreshVideoCoordinates() {
@@ -198,15 +217,31 @@ function stopVideoStream(stream: SimulatorStream) {
   if (stream.streamId) void callTool("device_stream_stop", { sessionId: stream.sessionId, streamId: stream.streamId }).catch(() => {});
 }
 
+function decodeBase64(value: string) {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+/**
+ * One read is pending at a time. ChatGPT's desktop host runs at most three
+ * requests per MCP app at once, and live input must not queue behind video.
+ * The server answers as soon as a frame exists, so a single read keeps up at 60 fps.
+ */
 function videoTransport(stream: SimulatorStream): SimulatorVideoTransport {
   let stopped = false;
+  let sequence = 0;
   return {
     async read() {
       const result = await callTool("device_stream_read", { sessionId: stream.sessionId, streamId: stream.streamId });
       if (stopped) return [];
-      const batch = result._meta?.["apple-device-hub/video"] as { sessionId?: string; streamId?: string; frames?: unknown; active?: boolean } | undefined;
+      const batch = result._meta?.["apple-device-hub/video"] as { sessionId?: string; streamId?: string; sequence?: unknown; frames?: unknown; active?: boolean } | undefined;
       if (!batch || batch.sessionId !== stream.sessionId || batch.streamId !== stream.streamId || batch.active !== true || !Array.isArray(batch.frames) || !batch.frames.every(frame => typeof frame === "string")) throw new Error("Device Hub returned an incomplete video batch.");
-      return batch.frames.map(frame => Uint8Array.from(atob(frame as string), byte => byte.charCodeAt(0)));
+      // A lost or repeated batch breaks the decoder's reference chain.
+      if (batch.sequence !== sequence) throw new Error("Device Hub video batches arrived out of order.");
+      sequence++;
+      return (batch.frames as string[]).map(decodeBase64);
     },
     stop() {
       if (stopped) return;
@@ -214,6 +249,26 @@ function videoTransport(stream: SimulatorStream): SimulatorVideoTransport {
       stopVideoStream(stream);
     },
   };
+}
+
+/**
+ * Video larger than the displayed frame only costs bandwidth and decode time.
+ * The still sits under the canvas at the same size. Before the first still,
+ * assume portrait, whose long edge is the frame's maximum height.
+ */
+function videoMaxDimension() {
+  const shown = screen.getBoundingClientRect();
+  const stage = screenFrame.parentElement;
+  const edge = Math.max(shown.width, shown.height) || parseFloat(getComputedStyle(videoCanvas).maxHeight) || Math.max(stage?.clientWidth ?? 0, stage?.clientHeight ?? 0);
+  const pixels = Math.max(edge * (window.devicePixelRatio || 1), videoSizeFloor ?? 0);
+  return pixels >= 320 ? Math.min(8192, Math.ceil(pixels / 64) * 64) : undefined;
+}
+
+/** The size a resized panel or a rotation to landscape needs once it outgrows the stream; the native resolution is the limit. */
+function outgrownVideoDimension(dimensions: { width: number; height: number }) {
+  const needed = videoMaxDimension();
+  if (videoRequestedDimension === undefined || needed === undefined || needed <= videoRequestedDimension * 1.25 || Math.max(dimensions.width, dimensions.height) < videoRequestedDimension - 2) return undefined;
+  return needed;
 }
 
 async function startVideo() {
@@ -228,7 +283,9 @@ async function startVideo() {
   try {
     format = h264Fallback ? "h264" : await preferredVideoCodec();
     if (generation !== videoGeneration || session?.id !== current.id || !canStreamVideo()) return;
-    const result = await callTool("device_stream", { sessionId: current.id, codec: format });
+    const maxDimension = videoMaxDimension();
+    videoRequestedDimension = maxDimension;
+    const result = await callTool("device_stream", { sessionId: current.id, codec: format, ...(maxDimension ? { maxDimension } : {}) });
     const stream = result.structuredContent as unknown as SimulatorStream | undefined;
     if (generation !== videoGeneration || session?.id !== current.id || !canStreamVideo()) {
       if (stream?.sessionId === current.id && typeof stream.streamId === "string") stopVideoStream(stream);
@@ -251,7 +308,22 @@ async function startVideo() {
       screenFrame.hidden = false;
       videoReady = true;
       if (firstFrame) publish();
-      videoStatus(`Live video · ${stream.format === "hevc" ? "HEVC" : "H.264"} · ${stream.fps} fps`);
+      // The helper sends frames only when the screen changes, so the measured rate reports motion.
+      const now = performance.now();
+      renderedAt.push(now);
+      while (renderedAt[0]! < now - 1000) renderedAt.shift();
+      if (firstFrame || now - fpsLabelAt >= 1000) {
+        fpsLabelAt = now;
+        videoStatus(`Live video · ${stream.format === "hevc" ? "HEVC" : "H.264"} · ${renderedAt.length >= 5 ? `${renderedAt.length} fps` : "idle"}`);
+        const outgrown = liveTouch ? undefined : outgrownVideoDimension(dimensions);
+        if (outgrown) {
+          // The restart measures the still, which can lag a rotation; keep the size measured from the live frame.
+          videoSizeFloor = outgrown;
+          stopVideo();
+          schedulePoll();
+          return;
+        }
+      }
       // A rotated frame must never use the preceding portrait touch coordinates.
       if (firstFrame || capture && !coordinateSpaceMatchesFrame(capture.coordinateSpace, dimensions)) refreshVideoCoordinates();
     }, error => {
@@ -303,7 +375,88 @@ function syncVideo() {
 }
 
 function canPoll() {
-  return !ended && initialized && liveEnabled && !document.hidden && visible && !busy && !streaming && !pointerStart && !settingsOpen;
+  return !ended && initialized && liveEnabled && !document.hidden && visible && !busy && !streaming && !pointerStart && !liveTouch && !settingsOpen;
+}
+
+function liveInputReady() {
+  return videoReady && !liveInputError && !videoCanvas.hidden && canStreamVideo();
+}
+
+function resetLiveInput() {
+  liveTouch = undefined;
+  liveQueue = [];
+  liveInputAt = undefined;
+  liveInputError = undefined;
+}
+
+function queueLiveInput(event: LiveInput) {
+  const last = liveQueue.at(-1);
+  // A slow host round trip coalesces moves but keeps the gesture's elapsed time.
+  if (event.type === "move" && last?.type === "move" && liveQueue.length >= 16) {
+    last.x = event.x;
+    last.y = event.y;
+    last.dt = Math.min(1000, last.dt + event.dt);
+  } else liveQueue.push(event);
+  void sendLiveInput();
+}
+
+function elapsedInput(time: number) {
+  const elapsed = liveInputAt === undefined ? 0 : Math.round(Math.max(0, Math.min(1000, time - liveInputAt)));
+  liveInputAt = time;
+  return elapsed;
+}
+
+/** One request is in flight at a time, so batches arrive in order; later events wait for its reply. */
+async function sendLiveInput() {
+  const current = session;
+  if (liveSending || !liveQueue.length || !current) return;
+  const events = liveQueue;
+  liveQueue = [];
+  liveSending = true;
+  try {
+    await callTool("device_input", { sessionId: current.id, events });
+  } catch (error) {
+    // Input sent as video stops fails harmlessly; only a failure with video running disables live input.
+    if (session?.id === current.id && liveInputReady()) {
+      liveInputError = errorMessage(error);
+      liveTouch = undefined;
+      liveQueue = [];
+      gestureMark.hidden = true;
+      showNotice(`${liveInputError} Using Xcode input instead.`, true);
+    }
+  } finally {
+    liveSending = false;
+    if (liveQueue.length) void sendLiveInput();
+  }
+}
+
+function framePoint(event: PointerEvent) {
+  const rect = videoCanvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return undefined;
+  const fraction = (value: number) => Math.round(Math.max(0, Math.min(1, value)) * 10_000) / 10_000;
+  return { x: fraction((event.clientX - rect.left) / rect.width), y: fraction((event.clientY - rect.top) / rect.height) };
+}
+
+function eventTime(event: PointerEvent) {
+  return Number.isFinite(event.timeStamp) && event.timeStamp > 0 ? event.timeStamp : performance.now();
+}
+
+function placeGestureMark(event: PointerEvent) {
+  const frame = screenFrame.getBoundingClientRect();
+  gestureMark.style.left = `${event.clientX - frame.left}px`;
+  gestureMark.style.top = `${event.clientY - frame.top}px`;
+  gestureMark.hidden = false;
+}
+
+function finishLiveTouch(event: PointerEvent, type: "up" | "cancel") {
+  const touch = liveTouch!;
+  liveTouch = undefined;
+  gestureMark.hidden = true;
+  if (screenFrame.hasPointerCapture(event.pointerId)) screenFrame.releasePointerCapture(event.pointerId);
+  if (touch.epoch !== lifecycle) return;
+  queueLiveInput({ type, ...(framePoint(event) ?? touch.point), dt: elapsedInput(eventTime(event)) });
+  // The video already shows the result; refresh elements once the gesture has had time to land.
+  scheduleVideoObservation(1000);
 }
 
 function schedulePoll() {
@@ -369,6 +522,7 @@ function selectSession(next: Session) {
     lifecycle++;
     stopVideo(true);
     resetStream();
+    resetLiveInput();
     capture = undefined;
     screenImage = undefined;
     pointerStart = undefined;
@@ -389,6 +543,7 @@ function clearSession() {
   lifecycle++;
   stopVideo(true);
   resetStream();
+  resetLiveInput();
   stopPolling();
   session = undefined;
   capture = undefined;
@@ -497,6 +652,12 @@ async function streamFrame(current: Session) {
 
 export async function performAction(action: DeviceAction) {
   if (!session) return;
+  // Xcode's Home takes seconds; the simulator's own button responds in one frame.
+  if (action.type === "button" && action.button === "home" && liveInputReady()) {
+    queueLiveInput({ type: "home", dt: elapsedInput(performance.now()) });
+    scheduleVideoObservation(1000);
+    return true;
+  }
   const current = session;
   const epoch = lifecycle;
   return run(async () => {
@@ -625,7 +786,7 @@ export function setLive(value: boolean) {
   schedulePoll();
 }
 
-export function retryVideo() { stopVideo(); videoFailures = 0; h264Fallback = false; schedulePoll(); }
+export function retryVideo() { stopVideo(); videoFailures = 0; h264Fallback = false; liveInputError = undefined; schedulePoll(); }
 
 export async function setAccessibility(requested: boolean) {
   const epoch = lifecycle;
@@ -660,19 +821,36 @@ function devicePoint(event: PointerEvent) {
 
 function bindScreen() {
 screenFrame.addEventListener("pointerdown", event => {
-  if (busy || !session || ended || event.button !== 0) return;
+  if (!session || ended || event.button !== 0 || liveTouch) return;
+  if (!inspecting && liveInputReady()) {
+    const point = framePoint(event);
+    if (!point) return;
+    event.preventDefault();
+    liveTouch = { id: event.pointerId, epoch: lifecycle, point };
+    screenFrame.setPointerCapture(event.pointerId);
+    placeGestureMark(event);
+    queueLiveInput({ type: "down", ...point, dt: elapsedInput(eventTime(event)) });
+    return;
+  }
+  if (busy) return;
   const point = devicePoint(event);
   if (!point) return;
   event.preventDefault();
   stopPolling();
   pointerStart = { ...point, id: event.pointerId, clientX: event.clientX, clientY: event.clientY, time: performance.now(), epoch: lifecycle, width: capture!.coordinateSpace.width, height: capture!.coordinateSpace.height };
   screenFrame.setPointerCapture(event.pointerId);
-  const mark = gestureMark;
-  mark.style.left = `${event.clientX - screenFrame.getBoundingClientRect().left}px`;
-  mark.style.top = `${event.clientY - screenFrame.getBoundingClientRect().top}px`;
-  mark.hidden = false;
+  placeGestureMark(event);
+});
+screenFrame.addEventListener("pointermove", event => {
+  if (liveTouch?.id !== event.pointerId) return;
+  const point = framePoint(event);
+  if (!point) return;
+  liveTouch.point = point;
+  placeGestureMark(event);
+  if (liveTouch.epoch === lifecycle) queueLiveInput({ type: "move", ...point, dt: elapsedInput(eventTime(event)) });
 });
 screenFrame.addEventListener("pointerup", event => {
+  if (liveTouch?.id === event.pointerId) { finishLiveTouch(event, "up"); return; }
   const start = pointerStart;
   pointerStart = undefined;
   gestureMark.hidden = true;
@@ -684,7 +862,12 @@ screenFrame.addEventListener("pointerup", event => {
   if (distance < 8) void performAction({ type: "tap", x: start.x, y: start.y });
   else void performAction({ type: "swipe", x: start.x, y: start.y, toX: end.x, toY: end.y, duration: Math.max(0.1, Math.min(5, (performance.now() - start.time) / 1000)) });
 });
-screenFrame.addEventListener("pointercancel", () => { pointerStart = undefined; gestureMark.hidden = true; schedulePoll(); });
+screenFrame.addEventListener("pointercancel", event => {
+  if (liveTouch?.id === event.pointerId) { finishLiveTouch(event, "cancel"); return; }
+  pointerStart = undefined;
+  gestureMark.hidden = true;
+  schedulePoll();
+});
 screenFrame.addEventListener("contextmenu", event => event.preventDefault());
 document.addEventListener("visibilitychange", schedulePoll);
 }

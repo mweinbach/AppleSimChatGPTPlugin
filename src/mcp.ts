@@ -8,12 +8,12 @@ import type { OpenAIUiToolMetadata } from "@openai/mcp-extensions/server";
 import type { AppleHub } from "./apple.js";
 import { SessionExpiredError } from "./apple.js";
 import { formatElement } from "./elements.js";
-import { actionSchema, HIERARCHY_META_KEY, settingsSchema, type Capture, type CaptureState } from "./shared.js";
+import { actionSchema, HIERARCHY_META_KEY, liveInputSchema, settingsSchema, type Capture, type CaptureState } from "./shared.js";
 import { computerAction, computerInputs, type ComputerToolName } from "./computer.js";
 export { HIERARCHY_META_KEY };
 
 export const UI_URI = "ui://apple-device-hub/viewer";
-export type Hub = Pick<AppleHub, "status" | "connect" | "capture" | "frame" | "stream" | "streamRead" | "streamStop" | "action" | "settings" | "disconnect" | "close">;
+export type Hub = Pick<AppleHub, "status" | "connect" | "capture" | "frame" | "stream" | "streamRead" | "streamStop" | "input" | "action" | "settings" | "disconnect" | "close">;
 const sessionId = z.string().uuid();
 const resolution = z.enum(["points", "full"]).optional().describe("Image size. Leave unset: the default sizes the screenshot in logical points so image pixels equal tap coordinates.");
 export const toolInputs = {
@@ -24,9 +24,10 @@ export const toolInputs = {
   device_connect: z.object({ deviceId: z.string().min(1).max(200) }),
   device_capture: z.object({ sessionId, accessibilityEnabled: z.boolean().optional(), resolution }),
   device_frame: z.object({ sessionId }),
-  device_stream: z.object({ sessionId, codec: z.enum(["hevc", "h264"]).default("h264") }),
+  device_stream: z.object({ sessionId, codec: z.enum(["hevc", "h264"]).default("h264"), maxDimension: z.number().int().min(320).max(8192).optional().describe("Longest encoded edge in pixels; the simulator's resolution when larger or unset.") }),
   device_stream_read: z.object({ sessionId, streamId: z.string().regex(/^[a-f0-9]{48}$/) }),
   device_stream_stop: z.object({ sessionId, streamId: z.string().regex(/^[a-f0-9]{48}$/) }),
+  device_input: z.object({ sessionId, events: z.array(liveInputSchema).min(1).max(64) }),
   device_action: z.object({ sessionId, action: actionSchema, settle: z.boolean().optional().describe("Wait for animations to finish before observing (default true)."), resolution }),
   device_settings: z.object({ sessionId, resolution, settings: settingsSchema.refine(value => Object.values(value).some(item => item !== undefined), "Choose at least one setting.") }),
   device_disconnect: z.object({ sessionId }),
@@ -86,7 +87,7 @@ export async function callHubTool(hub: Hub, name: string, args: unknown): Promis
       }
       case "device_stream": {
         const input = toolInputs.device_stream.parse(args);
-        return dataResult(await hub.stream(input.sessionId, input.codec));
+        return dataResult(await hub.stream(input.sessionId, input.codec, input.maxDimension));
       }
       case "device_stream_read": {
         const input = toolInputs.device_stream_read.parse(args);
@@ -98,6 +99,11 @@ export async function callHubTool(hub: Hub, name: string, args: unknown): Promis
         const input = toolInputs.device_stream_stop.parse(args);
         await hub.streamStop(input.sessionId, input.streamId);
         return dataResult({ stopped: true });
+      }
+      case "device_input": {
+        const input = toolInputs.device_input.parse(args);
+        await hub.input(input.sessionId, input.events);
+        return dataResult({ delivered: input.events.length });
       }
       case "device_action": {
         const input = toolInputs.device_action.parse(args);
@@ -149,6 +155,7 @@ export function createHubServer(hub: Hub, assetRoot: URL): McpServer {
     { name: "device_stream", title: "Stream simulator video", description: "Start a stateful live hardware HEVC or H.264 simulator video connection for the viewer. Accessibility and device actions continue through MCP tools.", readOnly: false, appOnly: true },
     { name: "device_stream_read", title: "Read simulator video", description: "Read a bounded batch of native video access units through the host transport for the embedded viewer.", readOnly: true, appOnly: true },
     { name: "device_stream_stop", title: "Stop simulator video", description: "Release an embedded viewer's native video relay and revoke its stream capability.", readOnly: false, destructive: true, appOnly: true },
+    { name: "device_input", title: "Live simulator input", description: "Deliver the viewer's live touches and Home presses to a simulator with running video. Coordinates are fractions of the displayed video frame; timing between events is preserved.", readOnly: false, destructive: true, openWorld: true, appOnly: true },
     { name: "device_action", title: "Control device", description: "Act on the device, then return the resulting screen and element list after animations settle. Prefer element targets over coordinates: {\"type\":\"tap\",\"element\":{\"ref\":\"e12\"}} or {\"element\":{\"label\":\"General\",\"role\":\"Button\"}}. Refs come from the latest capture or action result. Other actions: type (optionally into an element, which is tapped first), scroll (direction is where the content goes: \"down\" reveals content below; optionally within an element), swipe with coordinates, button (home, lock, volumeUp, volumeDown), orientation, launchApp by bundle ID, openSettings. Coordinates are logical points and match pixels in the default screenshot.", readOnly: false, destructive: true, openWorld: true },
     { name: "device_settings", title: "Change device settings", description: "Change device appearance, Dynamic Type size, motion, transparency, or contrast through Apple's supported local tools. Settings persist on the selected device. Returns the resulting screen and observed setting values when available.", readOnly: false, destructive: true },
     { name: "device_disconnect", title: "Disconnect device", description: "End the Apple interaction session and release its resources.", readOnly: false, destructive: true },
