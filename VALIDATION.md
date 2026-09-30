@@ -250,3 +250,38 @@ checks that the plugin includes those files. The installer test uses a fixture
 reinstallation and command-failure propagation. The actual host's existing local
 marketplace also accepted repeat registration. This distribution check does not
 claim a fresh ChatGPT render or device interaction from the npm-installed plugin.
+
+## Gallery preparation and release 0.1.3 — September 30, 2026
+
+Release **0.1.3**, commit **`d58447e2c6a2374853cbf40e0bba4ce03f3db99f`**,
+adds portable Agent Plugins `plugin.json` and `mcp.json`, generates the legacy
+manifest from that source, supplies listing and review metadata, and builds a
+complete plugin ZIP alongside the two npm packages. Tool annotations now disclose
+stateful video start/stop and potentially destructive/open-world device input.
+
+- [CI run 36779804575](https://github.com/mweinbach/AppleSimChatGPTPlugin/actions/runs/36779804575)
+  passed on macOS 26 with Node 22 and Node 24. Each job passed type checking,
+  native build, **118 tests**, both npm archive checks and extracted ZIP checks.
+- [Publish run 36779979876](https://github.com/mweinbach/AppleSimChatGPTPlugin/actions/runs/36779979876)
+  passed, repeated those checks, published both npm packages through trusted
+  publishing with provenance, and created
+  [release v0.1.3](https://github.com/mweinbach/AppleSimChatGPTPlugin/releases/tag/v0.1.3)
+  with both tarballs, `apple-device-hub-0.1.3.zip` and `SHA256SUMS`.
+- The downloaded release ZIP matches its published SHA-256 checksum:
+  `22772a16ae96564552d98fe734ed053444092d3e8742dc5e32875075a8e277c0`.
+  It is **600,591 bytes**, well below the documented 100 MB upload limit.
+
+The ZIP probe launches the extracted portable MCP configuration without source
+dependencies, discovers **19 tools**, verifies the `global`, `thread` and
+`settings` entrypoints, reads the self-contained HTML, checks listing lengths and
+five positive/three negative review cases, compares its runtime bytes with the
+standalone build, and verifies the native helper's ad-hoc signature. The native
+helper is not Developer ID signed or notarized.
+
+This is local packaging/protocol evidence. The new review cases have not been
+completed end-to-end in an approved gallery host. Installed-host rendering and
+attachment acceptance, a public walkthrough, starter-prompt screenshots,
+publisher identity, final public terms, and OpenAI's local-MCP distribution
+decision remain separate requirements in the
+[submission packet](docs/gallery/SUBMISSION.md). No gallery submission or
+publication was performed.
