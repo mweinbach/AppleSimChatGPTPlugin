@@ -38,9 +38,9 @@ jobs:
           test "$(git rev-parse HEAD)" = "$(git rev-parse "$RELEASE_TAG^{commit}")"
       - run: npm ci
       - run: npm run typecheck
-      - run: npm test
       - run: npm run build
       - run: git diff --exit-code
+      - run: npm test
       - run: npm run pack
       - run: npm run verify:packages
       - name: Publish both packages using npm trusted publishing

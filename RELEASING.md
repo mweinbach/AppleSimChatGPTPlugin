@@ -11,8 +11,8 @@ npm login
 npm run build
 npm run pack
 npm run verify:packages
-npm publish release/apple-device-hub-mcp-0.1.0.tgz --access public
-npm publish release/apple-sim-chatgpt-plugin-0.1.0.tgz --access public
+npm publish ./release/apple-device-hub-mcp-0.1.0.tgz --access public
+npm publish ./release/apple-sim-chatgpt-plugin-0.1.0.tgz --access public
 ```
 
 Then configure both packages to trust this repository's exact release workflow:
