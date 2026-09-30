@@ -213,3 +213,40 @@ up this package; native-host HEVC rendering and attachment submission remain
 unverified in this existing chat.
 
 All validation sessions were disconnected, owned preview/probe processes and the owned browser tab were closed, and no native streaming helper remained. The simulator was left booted after returning it to Home; its appearance settings and empty search text were retained.
+
+## npm distribution and macOS 26 CI — September 30, 2026
+
+Release **0.1.2**, commit **`88917ec81083f81bac8e99a7915cfcad9fdfdb9c`**,
+publishes two separate packages: `apple-device-hub-mcp` for standalone clients,
+and `apple-sim-chatgpt-plugin` containing the plugin manifest, skills, installer
+and a copy of the same MCP runtime. Both packages restrict npm installation to
+Apple Silicon Macs and include a signed arm64 capture helper. No compilation or
+runtime npm dependency installation is needed on the user's machine.
+
+- [CI run 36777294749](https://github.com/mweinbach/AppleSimChatGPTPlugin/actions/runs/36777294749)
+  passed on the `macos-26` arm64 runner with Node 22 and Node 24. Each job passed
+  type checks, all **118 tests**, the native build, package creation and archive
+  verification. CI uploads both built package archives.
+- [Publish run 36777298306](https://github.com/mweinbach/AppleSimChatGPTPlugin/actions/runs/36777298306)
+  passed on **macOS 26.6.2**, Node **24.20.0**, npm **11.19.0**. It checked the tag
+  and `main` ancestry, repeated the build/tests/package verification, published
+  both packages using their configured GitHub trusted publisher, and created
+  [release v0.1.2](https://github.com/mweinbach/AppleSimChatGPTPlugin/releases/tag/v0.1.2)
+  with both archives and `SHA256SUMS`. No npm token is stored in GitHub.
+- npm registry metadata confirms **`latest = 0.1.2`**, **`cpu = ["arm64"]`** and
+  SLSA provenance attestations for both packages. The registry initially returned
+  404 while processing the CI publications; availability was checked again after
+  processing completed. Both `npx --yes <package>@latest --version` commands
+  return **0.1.2**.
+
+Archive verification extracts each tarball to a temporary directory outside the
+checkout, launches its bundled MCP server from an unrelated working directory,
+checks all **19 tools** and the `global`, `thread` and `settings` entrypoints,
+and reads the self-contained viewer HTML. It verifies the native binary's arm64
+architecture and signature, confirms both packages contain identical runtime
+bytes, confirms the standalone package excludes plugin metadata and skills, and
+checks that the plugin includes those files. The installer test uses a fixture
+`codex` executable to verify persistent copying, marketplace registration,
+reinstallation and command-failure propagation. The actual host's existing local
+marketplace also accepted repeat registration. This distribution check does not
+claim a fresh ChatGPT render or device interaction from the npm-installed plugin.
