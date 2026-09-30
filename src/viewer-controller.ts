@@ -1,4 +1,5 @@
 import { App } from "@modelcontextprotocol/ext-apps";
+import { version } from "./version.js";
 import { applyDocumentTheme, applyHostStyleVariables } from "@modelcontextprotocol/ext-apps/app-with-deps";
 import { OpenAIExtensions, OPENAI_MODEL_CONTEXT_KEY } from "@openai/mcp-extensions/app";
 import { HIERARCHY_META_KEY, sessionSchema, type CaptureState, type DeviceAction, type DeviceSettings, type HubState, type Session } from "./shared.js";
@@ -12,7 +13,7 @@ type PreviewWindow = Window & { __APPLE_DEVICE_HUB_PREVIEW__?: boolean };
 
 const preview = (window as PreviewWindow).__APPLE_DEVICE_HUB_PREVIEW__ === true;
 const useVideoRelay = !preview || new URLSearchParams(window.location.search).get("transport") === "mcp";
-const app = new App({ name: "apple-device-hub", version: "0.1.0" });
+const app = new App({ name: "apple-device-hub", version });
 const extensions = new OpenAIExtensions(app);
 let root: HTMLElement;
 let screen: HTMLImageElement;

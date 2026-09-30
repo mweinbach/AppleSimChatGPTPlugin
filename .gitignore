@@ -2,6 +2,8 @@ node_modules/
 artifacts/*
 !artifacts/.gitkeep
 plugins/apple-device-hub/dist/
+packages/apple-device-hub-mcp/dist/
+release/
 .DS_Store
 .claude/settings.local.json
 .env

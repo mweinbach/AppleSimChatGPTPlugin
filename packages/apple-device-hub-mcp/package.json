@@ -1,13 +1,13 @@
 {
-  "name": "apple-sim-chatgpt-plugin",
+  "name": "apple-device-hub-mcp",
   "version": "0.1.0",
+  "description": "Local Apple simulator and device MCP server with a bundled MCP App viewer",
   "type": "module",
-  "description": "ChatGPT plugin with Apple device skills and a bundled Apple Device Hub MCP server and viewer",
   "license": "UNLICENSED",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/mweinbach/AppleSimChatGPTPlugin.git",
-    "directory": "plugins/apple-device-hub"
+    "directory": "packages/apple-device-hub-mcp"
   },
   "engines": {
     "node": ">=22"
@@ -20,15 +20,11 @@
     "x64"
   ],
   "bin": {
-    "apple-sim-chatgpt-plugin": "bin/install.mjs"
+    "apple-device-hub-mcp": "bin/server.mjs"
   },
   "files": [
     "bin",
     "dist",
-    ".codex-plugin",
-    ".mcp.json",
-    "assets",
-    "skills",
     "LICENSE.mcp-extensions"
   ],
   "publishConfig": {

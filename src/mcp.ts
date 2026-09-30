@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { version } from "./version.js";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -136,7 +137,7 @@ export async function appHtml(assetRoot: URL, preview = false): Promise<string> 
 }
 
 export function createHubServer(hub: Hub, assetRoot: URL): McpServer {
-  const server = new McpServer({ name: "apple-device-hub", version: "0.1.0" }, { instructions: "Use open_device_hub to show the device viewer. Choose a device from device_hub_status and connect it, then capture its screen before interacting. Coordinates are logical device points in coordinateSpace, not screenshot pixels. When accessibility is enabled, use the latest hierarchy for positions. device_capture's accessibilityEnabled flag controls whether the hierarchy is exposed; it does not change iOS accessibility settings. Device operations pass through Apple's Xcode bridge. Disconnect sessions when finished." });
+  const server = new McpServer({ name: "apple-device-hub", version }, { instructions: "Use open_device_hub to show the device viewer. Choose a device from device_hub_status and connect it, then capture its screen before interacting. Coordinates are logical device points in coordinateSpace, not screenshot pixels. When accessibility is enabled, use the latest hierarchy for positions. device_capture's accessibilityEnabled flag controls whether the hierarchy is exposed; it does not change iOS accessibility settings. Device operations pass through Apple's Xcode bridge. Disconnect sessions when finished." });
   registerAppResource(server, "Apple Device Hub", UI_URI, {}, async () => ({ contents: [{ uri: UI_URI, mimeType: RESOURCE_MIME_TYPE, text: await appHtml(assetRoot), _meta: { ui: { prefersBorder: false } } }] }));
   const definitions: { name: ToolName; title: string; description: string; readOnly: boolean; appOnly?: boolean; opening?: OpenAIUiToolMetadata }[] = [
     { name: "open_device_hub", title: "Apple Device Hub", description: "Open the local Apple Device Hub. View and control simulators or connected Apple devices beside the conversation.", readOnly: true, opening: { entrypoints: [{ type: "global" }, { type: "thread" }], preferredModelDisplayMode: "fullscreen" } },

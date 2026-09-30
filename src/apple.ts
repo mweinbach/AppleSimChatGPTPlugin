@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { version } from './version.js';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -39,7 +40,7 @@ export class NativeAppleBoundary implements AppleBoundary {
   private async connect(): Promise<Client> {
     if (!this.client) {
       this.client = (async () => {
-        const client = new Client({ name: 'apple-device-hub', version: '0.1.0' }, { capabilities: {} });
+        const client = new Client({ name: 'apple-device-hub', version }, { capabilities: {} });
         client.onclose = () => { this.client = undefined; };
         const transport = new StdioClientTransport({ command: '/usr/bin/xcrun', args: ['mcpbridge'], stderr: 'pipe' });
         transport.stderr?.on('data', (chunk: Buffer) => { this.stderr = (this.stderr + chunk.toString()).slice(-4000); });

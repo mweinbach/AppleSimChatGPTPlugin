@@ -1,0 +1,60 @@
+name: Publish
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag (v0.1.0)
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: publish-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: macos-15
+    timeout-minutes: 25
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Verify release tag and branch
+        run: |
+          node --input-type=module -e 'import p from "./package.json" with { type: "json" }; if (process.env.RELEASE_TAG !== `v${p.version}` || !/^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(process.env.RELEASE_TAG)) process.exit(1);'
+          git merge-base --is-ancestor HEAD origin/main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "$RELEASE_TAG^{commit}")"
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: git diff --exit-code
+      - run: npm run pack
+      - run: npm run verify:packages
+      - name: Publish both packages using npm trusted publishing
+        run: node scripts/publish.mjs
+      - name: Create GitHub release with package archives and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shasum -a 256 release/*.tgz > release/SHA256SUMS
+          if ! gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            if [[ "$RELEASE_TAG" == *-* ]]; then
+              gh release create "$RELEASE_TAG" --verify-tag --generate-notes --prerelease
+            else
+              gh release create "$RELEASE_TAG" --verify-tag --generate-notes
+            fi
+          fi
+          gh release upload "$RELEASE_TAG" release/*.tgz release/SHA256SUMS --clobber
