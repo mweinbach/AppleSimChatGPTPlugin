@@ -163,6 +163,14 @@ test("MCP discovery advertises native host entrypoints and opening accepts empty
     for (const name of ["device_stream_read", "device_stream_stop"]) {
       assert.deepEqual((tools.find(tool => tool.name === name)!._meta?.ui as Record<string, unknown>).visibility, ["app"]);
     }
+    const destructive = new Set(["device_action", "device_settings", "device_disconnect", "device_stream_stop", "simulator_click", "simulator_drag", "simulator_type_text", "simulator_press_key"]);
+    const openWorld = new Set(["device_action", "simulator_click", "simulator_drag", "simulator_type_text", "simulator_press_key"]);
+    for (const tool of tools) {
+      assert.equal(tool.annotations?.destructiveHint, destructive.has(tool.name), `${tool.name} reports destructive effects`);
+      assert.equal(tool.annotations?.openWorldHint, openWorld.has(tool.name), `${tool.name} reports arbitrary app destinations`);
+    }
+    assert.equal(tools.find(tool => tool.name === "device_stream")!.annotations?.readOnlyHint, false);
+    assert.equal(tools.find(tool => tool.name === "device_stream_stop")!.annotations?.readOnlyHint, false);
     const resource = await client.readResource({ uri: UI_URI });
     assert.deepEqual(resource.contents[0]._meta?.ui, { prefersBorder: false });
     assert.deepEqual((tools.find(tool => tool.name === "device_capture")!._meta?.ui as Record<string, unknown>).visibility, ["app", "model"]);

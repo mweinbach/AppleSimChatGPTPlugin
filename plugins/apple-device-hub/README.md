@@ -1,5 +1,7 @@
 # Apple Device Hub ChatGPT Plugin
 
+Gallery preparation and the local MCP review route are documented in the [submission packet](https://github.com/mweinbach/AppleSimChatGPTPlugin/blob/main/docs/gallery/SUBMISSION.md). The portable `plugin.json` includes listing and review information; `mcp.json` starts the bundled local server. This package does not claim public gallery approval.
+
 Plugin for ChatGPT desktop containing device skills, plugin metadata, and a bundled build of the independent `apple-device-hub-mcp` server and its viewer. The plugin starts its included server directly; it does not fetch npm packages at runtime.
 
 Requires an Apple Silicon Mac, macOS 14+, Node 22+, the ChatGPT desktop host with local plugin support, its `codex` CLI on PATH, and Xcode 27 with **Settings → Intelligence → Model Context Protocol** enabled.

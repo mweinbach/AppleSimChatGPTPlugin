@@ -50,7 +50,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          shasum -a 256 release/*.tgz > release/SHA256SUMS
+          shasum -a 256 release/*.tgz release/*.zip > release/SHA256SUMS
           if ! gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
             if [[ "$RELEASE_TAG" == *-* ]]; then
               gh release create "$RELEASE_TAG" --verify-tag --generate-notes --prerelease
@@ -58,4 +58,4 @@ jobs:
               gh release create "$RELEASE_TAG" --verify-tag --generate-notes
             fi
           fi
-          gh release upload "$RELEASE_TAG" release/*.tgz release/SHA256SUMS --clobber
+          gh release upload "$RELEASE_TAG" release/*.tgz release/*.zip release/SHA256SUMS --clobber

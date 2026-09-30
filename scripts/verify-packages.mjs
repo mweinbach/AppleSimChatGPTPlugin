@@ -52,6 +52,10 @@ try {
     } else {
       const manifest = JSON.parse(await readFile(join(packageRoot, ".codex-plugin", "plugin.json"), "utf8"));
       assert.equal(manifest.version, version);
+      const portable = JSON.parse(await readFile(join(packageRoot, "plugin.json"), "utf8"));
+      assert.equal(portable.version, version);
+      assert.deepEqual(portable.extensions["com.openai"].interface, manifest.interface);
+      assert.deepEqual(JSON.parse(await readFile(join(packageRoot, "mcp.json"), "utf8")).mcpServers["apple-device-hub"].args, ["./dist/server.js"]);
       assert.ok((await readFile(join(packageRoot, "skills", "device-hub", "SKILL.md"), "utf8")).length > 0);
       const configuration = JSON.parse(await readFile(join(packageRoot, ".mcp.json"), "utf8"));
       assert.deepEqual(configuration.mcpServers["apple-device-hub"].args, ["./dist/server.js"]);
@@ -69,6 +73,7 @@ try {
         ["plugin", "marketplace", "add", installed], ["plugin", "add", "apple-device-hub@apple-sim-chatgpt-plugin"]
       ]);
       assert.deepEqual(await readFile(join(installed, "plugins", "apple-device-hub", "dist", "server.js")), await readFile(join(packageRoot, "dist", "server.js")));
+      assert.deepEqual(await readFile(join(installed, "plugins", "apple-device-hub", "plugin.json")), await readFile(join(packageRoot, "plugin.json")));
       const marketplace = JSON.parse(await readFile(join(installed, ".agents", "plugins", "marketplace.json"), "utf8"));
       assert.equal(marketplace.name, "apple-sim-chatgpt-plugin");
       execFileSync(process.execPath, args, { cwd: directory, env });
@@ -82,3 +87,4 @@ try {
 } finally {
   await rm(directory, { recursive: true, force: true });
 }
+await import("./verify-gallery.mjs");

@@ -2,7 +2,7 @@
 
 A local MCP server and sidebar app for viewing and controlling Apple simulators and connected physical devices inside the ChatGPT desktop app. Simulators have live hardware HEVC video with H.264 fallback; device actions and accessibility observations pass through Apple's Xcode MCP bridge.
 
-This project targets the ChatGPT/Codex desktop host with local-plugin support and uses its `global`, `thread`, and `settings` MCP App entrypoints. It does not require a cloud server or tunnel. See [VALIDATION.md](VALIDATION.md) for the host builds tested.
+This project targets the ChatGPT/Codex desktop host with local-plugin support and uses its `global`, `thread`, and `settings` MCP App entrypoints. It does not require a cloud server or tunnel. See [VALIDATION.md](VALIDATION.md) for the host builds tested, [privacy and data handling](docs/PRIVACY.md), and the [gallery submission packet](docs/gallery/SUBMISSION.md).
 
 ## Install
 
@@ -120,7 +120,7 @@ Open `http://127.0.0.1:4319` for a standalone preview of the same real backend. 
 
 The browser UI uses React, shadcn/ui (Radix Nova), and Tailwind CSS. `components.json` configures the component source under `src/components/ui`. The build bundles React and the compiled CSS into the self-contained MCP HTML resource; no CDN or separate web server is needed in the host. Rebuild and reload the preview to pick up UI changes without restarting the preview backend.
 
-`npm start` runs the local stdio MCP server. The root `.mcp.json` is a project launch configuration; the plugin's `.mcp.json` launches its bundled runtime. Keep server diagnostics on stderr.
+`npm start` runs the local stdio MCP server. The root `.mcp.json` is a project launch configuration; the plugin's portable `mcp.json` and legacy `.mcp.json` launch its bundled runtime. Edit the plugin's root `plugin.json` for listing and review metadata; the build generates its `.codex-plugin/plugin.json` compatibility manifest. Keep server diagnostics on stderr.
 
 The checked-in `apple-device-hub-local` marketplace points at this project's built plugin and is separate from the npm installer's marketplace. For source development updates, rebuild, apply the plugin-creator cachebuster workflow, and reinstall from `apple-device-hub-local`.
 

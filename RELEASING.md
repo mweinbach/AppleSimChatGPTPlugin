@@ -38,7 +38,9 @@ git push origin --tags
 
 `npm version` synchronizes the root lockfile, both package manifests and the plugin manifest before creating its commit and tag. Use `minor`, `major`, or an explicit semantic version when appropriate. Keep `main` current before tagging. The release workflow validates the committed manifests after building.
 
-The workflow rebuilds, tests and verifies both archives before publishing. A partial publication can be retried using **Actions → Publish → Run workflow** with its existing tag. Already-published versions are accepted only when their tarball integrity matches exactly. Different bytes require a new version. GitHub releases are created only after both packages publish successfully.
+The workflow rebuilds, tests and verifies both npm archives and the complete `apple-device-hub-<version>.zip` before publishing. The ZIP contains portable manifests, a compatibility manifest, skills and the bundled runtime. It is extracted and probed independently of the source checkout. GitHub releases attach all three archives with SHA-256 checksums. See [gallery submission](docs/gallery/SUBMISSION.md) for the local MCP review route; publishing npm or GitHub artifacts does not publish to the gallery.
+
+A partial publication can be retried using **Actions → Publish → Run workflow** with its existing tag. Already-published versions are accepted only when their tarball integrity matches exactly. Different bytes require a new version. GitHub releases are created only after both packages publish successfully.
 
 The initial bootstrap lacks GitHub provenance. All subsequent versions publish through the trusted workflow with provenance. The bootstrap tag should be recorded as a GitHub release after both packages exist; do not rerun it from another toolchain expecting identical native bytes.
 
