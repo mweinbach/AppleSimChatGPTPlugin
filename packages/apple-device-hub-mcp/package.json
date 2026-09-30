@@ -1,6 +1,6 @@
 {
   "name": "apple-device-hub-mcp",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Local Apple simulator and device MCP server with a bundled MCP App viewer",
   "type": "module",
   "license": "UNLICENSED",
