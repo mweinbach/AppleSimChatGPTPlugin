@@ -134,7 +134,7 @@ npm run verify:packages
 
 Archives are written to `release/`. Verification extracts each archive outside the checkout, initializes the bundled MCP server, reads its viewer resource, checks all three host entrypoints and 19 tools, verifies the arm64 native architecture and signing, and tests the plugin installer with a fixture CLI. The standalone package contains no plugin manifest or skills. The plugin archive includes both.
 
-[CI](.github/workflows/ci.yml) runs type checks, tests, arm64 builds and archive verification on Apple Silicon with Node 22 and Node 24 for pull requests and changes to `main`. [Publish](.github/workflows/publish.yml) repeats release checks for `v*` tags, requires the tag to match the package version and belong to `main`, publishes both packages with provenance using npm trusted publishing, and creates a GitHub release with archives and SHA-256 checksums. Stable releases use `latest`; prereleases use `next`. See [RELEASING.md](RELEASING.md) for setup and release commands.
+[CI](.github/workflows/ci.yml) runs type checks, tests, arm64 builds and archive verification on Apple Silicon macOS 26 with Node 22 and Node 24 for pull requests and changes to `main`. [Publish](.github/workflows/publish.yml) repeats release checks on macOS 26 for `v*` tags, requires the tag to match the package version and belong to `main`, publishes both packages with provenance using npm trusted publishing, and creates a GitHub release with archives and SHA-256 checksums. Stable releases use `latest`; prereleases use `next`. See [RELEASING.md](RELEASING.md) for setup and release commands.
 
 ## Boundaries
 
