@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "apple-device-hub": {
+      "command": "node",
+      "args": ["./dist/server.js"],
+      "cwd": "."
+    }
+  }
+}

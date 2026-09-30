@@ -1,0 +1,46 @@
+{
+  "name": "apple-device-hub",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local Apple Device Hub MCP app for ChatGPT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "start": "node plugins/apple-device-hub/dist/server.js",
+    "dev": "tsx src/server.ts",
+    "preview": "node plugins/apple-device-hub/dist/server.js --preview"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/ext-apps": "1.7.5",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@openai/mcp-extensions": "0.1.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.48.0",
+    "radix-ui": "^1.6.7",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "tailwind-merge": "^3.7.0",
+    "ws": "8.21.3",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.3",
+    "@types/node": "22.19.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/ws": "8.18.1",
+    "esbuild": "0.28.2",
+    "postcss": "^8.5.28",
+    "shadcn": "^4.21.0",
+    "tailwindcss": "^4.3.3",
+    "tsx": "4.21.0",
+    "tw-animate-css": "^1.4.0",
+    "typescript": "5.9.3"
+  }
+}

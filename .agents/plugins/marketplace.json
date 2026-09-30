@@ -1,0 +1,20 @@
+{
+  "name": "apple-device-hub-local",
+  "interface": {
+    "displayName": "Apple Device Hub Local"
+  },
+  "plugins": [
+    {
+      "name": "apple-device-hub",
+      "source": {
+        "source": "local",
+        "path": "./plugins/apple-device-hub"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
