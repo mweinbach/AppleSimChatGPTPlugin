@@ -31,6 +31,7 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false
       - name: Verify release tag and branch
         run: |
           node --input-type=module -e 'import p from "./package.json" with { type: "json" }; if (process.env.RELEASE_TAG !== `v${p.version}` || !/^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(process.env.RELEASE_TAG)) process.exit(1);'

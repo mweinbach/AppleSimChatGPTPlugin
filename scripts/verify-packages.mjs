@@ -24,7 +24,7 @@ try {
     assert.equal(execFileSync(process.execPath, [bin, "--version"], { cwd: directory, encoding: "utf8" }).trim(), version);
     assert.match(execFileSync(process.execPath, [bin, "--help"], { cwd: directory, encoding: "utf8" }), new RegExp(name));
     const native = join(packageRoot, "dist", "simulator-stream");
-    assert.deepEqual(execFileSync("xcrun", ["lipo", "-archs", native], { encoding: "utf8" }).trim().split(/\s+/).sort(), ["arm64", "x86_64"]);
+    assert.deepEqual(execFileSync("xcrun", ["lipo", "-archs", native], { encoding: "utf8" }).trim().split(/\s+/), ["arm64"]);
     execFileSync("codesign", ["--verify", "--strict", native]);
     const client = new Client({ name: "package-verification", version: "1" });
     const server = name === "apple-device-hub-mcp" ? bin : join(packageRoot, "dist", "server.js");
@@ -74,7 +74,7 @@ try {
       execFileSync(process.execPath, args, { cwd: directory, env });
       assert.throws(() => execFileSync(process.execPath, args, { cwd: directory, env: { ...env, PLUGIN_TEST_EXIT: "7" }, stdio: "pipe" }), error => error.status === 7);
     }
-    console.log(`Verified ${name}@${version}: isolated MCP, viewer, universal signed helper${name.includes("plugin") ? ", plugin installer and skills" : ""}.`);
+    console.log(`Verified ${name}@${version}: isolated MCP, viewer, signed arm64 helper${name.includes("plugin") ? ", plugin installer and skills" : ""}.`);
   }
   for (const file of ["server.js", "app.js", "app.css", "simulator-stream"]) {
     assert.deepEqual(await readFile(join(directory, "apple-device-hub-mcp", "package", "dist", file)), await readFile(join(directory, "apple-sim-chatgpt-plugin", "package", "dist", file)), `Plugin bundles the exact MCP build: ${file}`);

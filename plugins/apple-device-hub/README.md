@@ -2,7 +2,7 @@
 
 Plugin for ChatGPT desktop containing device skills, plugin metadata, and a bundled build of the independent `apple-device-hub-mcp` server and its viewer. The plugin starts its included server directly; it does not fetch npm packages at runtime.
 
-Requires macOS 14+, Node 22+, the ChatGPT desktop host with local plugin support, its `codex` CLI on PATH, and Xcode 27 with **Settings → Intelligence → Model Context Protocol** enabled.
+Requires an Apple Silicon Mac, macOS 14+, Node 22+, the ChatGPT desktop host with local plugin support, its `codex` CLI on PATH, and Xcode 27 with **Settings → Intelligence → Model Context Protocol** enabled.
 
 ```sh
 npx --yes apple-sim-chatgpt-plugin@latest install

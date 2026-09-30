@@ -6,13 +6,13 @@ This project targets the ChatGPT/Codex desktop host with local-plugin support an
 
 ## Install
 
-Requires macOS 14+, Node 22+, and Xcode 27 with **Settings → Intelligence → Model Context Protocol** enabled. Open Xcode before starting a device session. Physical devices must be paired, connected, unlocked, and configured for development.
+Requires an Apple Silicon Mac, macOS 14+, Node 22+, and Xcode 27 with **Settings → Intelligence → Model Context Protocol** enabled. Open Xcode before starting a device session. Physical devices must be paired, connected, unlocked, and configured for development.
 
 The standalone MCP server and ChatGPT plugin are separate npm packages:
 
 | Package | Contents | Usage |
 | --- | --- | --- |
-| `apple-device-hub-mcp` | Device tools, MCP App viewer and universal native capture helper | Launch from any compatible local MCP client. |
+| `apple-device-hub-mcp` | Device tools, MCP App viewer and arm64 native capture helper | Launch from any compatible local MCP client. |
 | `apple-sim-chatgpt-plugin` | Plugin manifest, skills and a bundled copy of the same MCP build | Install into the ChatGPT desktop host. |
 
 Install the plugin with the host's `codex` CLI available on PATH:
@@ -21,7 +21,7 @@ Install the plugin with the host's `codex` CLI available on PATH:
 npx --yes apple-sim-chatgpt-plugin@latest install
 ```
 
-The installer keeps a persistent copy under `~/Library/Application Support/AppleSimChatGPTPlugin/<version>` and registers it with the host. Repeat the command to update. The installed plugin starts its bundled server directly, without fetching npm packages. Both packages include a signed universal helper for Apple Silicon and Intel Macs; users do not compile it themselves.
+The installer keeps a persistent copy under `~/Library/Application Support/AppleSimChatGPTPlugin/<version>` and registers it with the host. Repeat the command to update. The installed plugin starts its bundled server directly, without fetching npm packages. Both packages include a signed arm64 helper for Apple Silicon Macs; users do not compile it themselves.
 
 To use only the MCP server, configure your MCP client with:
 
@@ -47,7 +47,7 @@ npm run typecheck
 npm test
 ```
 
-The MCP runtime is built under `packages/apple-device-hub-mcp/dist`. The build copies that exact runtime into `plugins/apple-device-hub/dist`, alongside the plugin's skills and manifests. It compiles a universal native simulator capture helper with the selected Xcode toolchain and bundles the server and browser dependencies. It uses the public npm release `@openai/mcp-extensions@0.1.0`, published September 29, 2026, pinned in the lockfile. See the [official SDK installation guide](https://github.com/openai/mcp-extensions/blob/node-v0.1.0/typescript/README.md).
+The MCP runtime is built under `packages/apple-device-hub-mcp/dist`. The build copies that exact runtime into `plugins/apple-device-hub/dist`, alongside the plugin's skills and manifests. It compiles a arm64 native simulator capture helper with the selected Xcode toolchain and bundles the server and browser dependencies. It uses the public npm release `@openai/mcp-extensions@0.1.0`, published September 29, 2026, pinned in the lockfile. See the [official SDK installation guide](https://github.com/openai/mcp-extensions/blob/node-v0.1.0/typescript/README.md).
 
 ## Use in ChatGPT
 
@@ -132,9 +132,9 @@ npm run pack
 npm run verify:packages
 ```
 
-Archives are written to `release/`. Verification extracts each archive outside the checkout, initializes the bundled MCP server, reads its viewer resource, checks all three host entrypoints and 19 tools, verifies both native architectures and signing, and tests the plugin installer with a fixture CLI. The standalone package contains no plugin manifest or skills. The plugin archive includes both.
+Archives are written to `release/`. Verification extracts each archive outside the checkout, initializes the bundled MCP server, reads its viewer resource, checks all three host entrypoints and 19 tools, verifies the arm64 native architecture and signing, and tests the plugin installer with a fixture CLI. The standalone package contains no plugin manifest or skills. The plugin archive includes both.
 
-[CI](.github/workflows/ci.yml) runs type checks, tests, universal builds and archive verification on Apple Silicon/Node 22 and Intel/Node 24 for pull requests and changes to `main`. [Publish](.github/workflows/publish.yml) repeats release checks for `v*` tags, requires the tag to match the package version and belong to `main`, publishes both packages with provenance using npm trusted publishing, and creates a GitHub release with archives and SHA-256 checksums. Stable releases use `latest`; prereleases use `next`. See [RELEASING.md](RELEASING.md) for setup and release commands.
+[CI](.github/workflows/ci.yml) runs type checks, tests, arm64 builds and archive verification on Apple Silicon with Node 22 and Node 24 for pull requests and changes to `main`. [Publish](.github/workflows/publish.yml) repeats release checks for `v*` tags, requires the tag to match the package version and belong to `main`, publishes both packages with provenance using npm trusted publishing, and creates a GitHub release with archives and SHA-256 checksums. Stable releases use `latest`; prereleases use `next`. See [RELEASING.md](RELEASING.md) for setup and release commands.
 
 ## Boundaries
 

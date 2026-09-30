@@ -1,8 +1,8 @@
 # Apple Device Hub MCP
 
-Standalone local MCP server for Apple simulators and connected devices. Includes the MCP App viewer and a prebuilt universal macOS video helper. This package has no plugin manifest or skills, and does not install a ChatGPT plugin.
+Standalone local MCP server for Apple simulators and connected devices. Includes the MCP App viewer and a prebuilt Apple Silicon macOS video helper. This package has no plugin manifest or skills, and does not install a ChatGPT plugin.
 
-Requires macOS 14+, Node 22+, and Xcode 27 with **Settings → Intelligence → Model Context Protocol** enabled. Open Xcode before using a device.
+Requires an Apple Silicon Mac, macOS 14+, Node 22+, and Xcode 27 with **Settings → Intelligence → Model Context Protocol** enabled. Open Xcode before using a device.
 
 Configure an MCP client to launch:
 

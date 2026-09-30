@@ -16,8 +16,7 @@
     "darwin"
   ],
   "cpu": [
-    "arm64",
-    "x64"
+    "arm64"
   ],
   "bin": {
     "apple-sim-chatgpt-plugin": "bin/install.mjs"
