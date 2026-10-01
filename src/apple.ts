@@ -8,7 +8,7 @@ import { promisify } from 'node:util';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { resolveElement, summarizeHierarchy, type Rect, type ScreenElement } from './elements.js';
-import { actionSchema, settingsSchema, textSizeSchema, type Capture, type Device, type DeviceAction, type DeviceSettings, type ElementTarget, type HubState, type LiveInput, type Session } from './shared.js';
+import { actionSchema, settingsSchema, textSizeSchema, type Capture, type Device, type DeviceAction, type DeviceActivity, type DeviceSettings, type ElementTarget, type HubState, type LiveInput, type Session } from './shared.js';
 import { SimulatorVideo, type VideoBatch, type VideoStream } from './video.js';
 
 export interface AppleBoundary {
@@ -233,7 +233,11 @@ interface NativeSession {
   timer?: ReturnType<typeof setTimeout>;
   closing: boolean;
   pending: number;
+  activity: DeviceActivity[];
 }
+
+const orientationNames = { portrait: 'portrait', landscapeLeft: 'landscape left', landscapeRight: 'landscape right', portraitUpsideDown: 'upside down' } as const;
+const buttonNames = { home: 'Home', lock: 'Lock', volumeUp: 'Volume Up', volumeDown: 'Volume Down' } as const;
 
 /** "points" sizes images to logical points for agents; "full" keeps device pixels for the viewer. */
 export type Resolution = 'points' | 'full';
@@ -272,6 +276,9 @@ export class AppleHub {
   private closed = false;
   private closing?: Promise<void>;
   private snapshots = 0;
+  private activityIds = 0;
+  /** The last activity each video stream has delivered to its viewer. */
+  private readonly activityCursors = new Map<string, { sessionId: string; delivered: number }>();
   private readonly video: SimulatorVideo;
 
   constructor(options: AppleHubOptions = {}) {
@@ -299,11 +306,12 @@ export class AppleHub {
       this.video.closeSession(sessionId);
       throw new SessionExpiredError();
     }
+    if (stream.streamId) this.activityCursors.set(stream.streamId, { sessionId, delivered: this.activityIds });
     this.keepVideoSessionAlive(sessionId);
     return stream;
   }
 
-  /** Video reads stay outside the device queue so input never pauses the live stream. */
+  /** Video reads stay outside the device queue so input never pauses the live stream. They also carry new device activity. */
   async streamRead(sessionId: string, streamId: string): Promise<VideoBatch> {
     const session = this.videoSession(sessionId);
     clearTimeout(session.timer);
@@ -311,7 +319,11 @@ export class AppleHub {
     try {
       const batch = await this.video.read(sessionId, streamId);
       this.videoSession(sessionId);
-      return batch;
+      const cursor = this.activityCursors.get(streamId);
+      const activity = cursor ? session.activity.filter(item => item.id > cursor.delivered) : [];
+      if (!activity.length) return batch;
+      cursor!.delivered = activity.at(-1)!.id;
+      return { ...batch, activity };
     } catch (error) {
       // Closing a device also closes its pending relay read. Preserve the
       // session-expired result so the viewer can clear the disconnected screen.
@@ -326,6 +338,12 @@ export class AppleHub {
   async streamStop(sessionId: string, streamId: string): Promise<void> {
     this.videoSession(sessionId);
     this.video.stop(sessionId, streamId);
+    if (this.activityCursors.get(streamId)?.sessionId === sessionId) this.activityCursors.delete(streamId);
+  }
+
+  private recordActivity(session: NativeSession, activity: Omit<DeviceActivity, 'id' | 'at'>) {
+    session.activity.push({ id: ++this.activityIds, at: new Date().toISOString(), ...activity });
+    if (session.activity.length > 20) session.activity.shift();
   }
 
   /** Live viewer input bypasses the serial device queue, so it never waits behind an observation. */
@@ -401,7 +419,7 @@ export class AppleHub {
     if (!data.interactionSessionKey) throw new Error('Xcode returned no device interaction session key.');
     const session: NativeSession = {
       public: { id: sessionId, device: { ...device, state: device.kind === 'simulator' ? 'Booted' : device.state }, accessibilityEnabled: true },
-      key: data.interactionSessionKey, queue: Promise.resolve(), closing: false, pending: 0,
+      key: data.interactionSessionKey, queue: Promise.resolve(), closing: false, pending: 0, activity: [],
     };
     this.sessions.set(session.public.id, session);
     try {
@@ -640,27 +658,46 @@ export class AppleHub {
           throw error;
         }
       };
+      // Viewers show each action on the live screen; typed text is not repeated there.
+      const note = (summary: string, element?: ScreenElement, at?: { x: number; y: number }, to?: { x: number; y: number }) => this.recordActivity(session, {
+        summary: element ? `${summary} ${element.label ? `“${element.label}”` : element.role}` : summary,
+        ...(element ? { ref: element.ref } : {}), ...(at ? { point: at } : {}), ...(to ? { to } : {}),
+      });
       let observation: NativeObservation;
       switch (action.type) {
         case 'tap': {
-          const target = action.element ? this.element(session, action.element).point : action.x !== undefined && action.y !== undefined ? { x: action.x, y: action.y } : undefined;
+          const element = action.element ? this.element(session, action.element) : undefined;
+          const target = element?.point ?? (action.x !== undefined && action.y !== undefined ? { x: action.x, y: action.y } : undefined);
           if (!target) throw new Error('Tap needs an element target or both x and y.');
-          observation = await synthesize(`${action.clickCount === 2 ? 'd' : 't'} ${point(target.x, target.y)}${action.duration !== undefined ? ` ${action.duration}` : ''}`);
+          const command = `${action.clickCount === 2 ? 'd' : 't'} ${point(target.x, target.y)}${action.duration !== undefined ? ` ${action.duration}` : ''}`;
+          note(action.clickCount === 2 ? 'Double-tap' : action.duration !== undefined ? 'Long press' : 'Tap', element, target);
+          observation = await synthesize(command);
           break;
         }
-        case 'swipe': observation = await synthesize(`t ${point(action.x, action.y)} f ${point(action.toX, action.toY)} ${action.duration}`); break;
+        case 'swipe': {
+          const command = `t ${point(action.x, action.y)} f ${point(action.toX, action.toY)} ${action.duration}`;
+          note('Swipe', undefined, { x: action.x, y: action.y }, { x: action.toX, y: action.toY });
+          observation = await synthesize(command);
+          break;
+        }
         case 'scroll': {
+          const element = action.element ? this.element(session, action.element) : undefined;
           const { from, to } = action.x !== undefined
             ? scrollFromPoint({ x: action.x, y: action.y! }, bounds(), action.direction, action.distance)
-            : scrollGesture(scrollRegion(action.element ? this.element(session, action.element).frame : undefined, bounds()), action.direction, action.distance);
-          observation = await synthesize(`t ${point(from.x, from.y)} f ${point(to.x, to.y)} 0.5`);
+            : scrollGesture(scrollRegion(element?.frame, bounds()), action.direction, action.distance);
+          const command = `t ${point(from.x, from.y)} f ${point(to.x, to.y)} 0.5`;
+          note(`Scroll ${action.direction}`, element, from, to);
+          observation = await synthesize(command);
           break;
         }
         case 'type':
           if (action.element || action.x !== undefined) {
-            const target = action.element ? this.element(session, action.element).point : { x: action.x!, y: action.y! };
-            await synthesize(`t ${point(target.x, target.y)}`);
-          }
+            const element = action.element ? this.element(session, action.element) : undefined;
+            const target = element?.point ?? { x: action.x!, y: action.y! };
+            const command = `t ${point(target.x, target.y)}`;
+            note(element ? 'Type into' : 'Type text', element, target);
+            await synthesize(command);
+          } else note('Type text');
           observation = await synthesize(keyboardCommand(action.text));
           break;
         case 'pressKey': {
@@ -668,17 +705,19 @@ export class AppleHub {
             Return: keyboardCommand('\n'), Tab: keyboardCommand('\t'), Backspace: keyboardCommand('\b'),
             Home: 'b h', Lock: 'b p', VolumeUp: 'b u', VolumeDown: 'b d',
           };
+          note(`Press ${action.key}`);
           observation = await synthesize(commands[action.key]);
           break;
         }
         case 'button': {
           const buttons = { home: 'h', lock: 'p', volumeUp: 'u', volumeDown: 'd' };
+          note(`Press ${buttonNames[action.button]}`);
           observation = await synthesize(`b ${buttons[action.button]}`);
           break;
         }
-        case 'orientation': observation = await synthesize(`orientation ${action.orientation}`); break;
-        case 'openSettings': observation = await synthesize('', 'com.apple.Preferences'); break;
-        case 'launchApp': observation = await synthesize('', action.bundleId); break;
+        case 'orientation': note(`Rotate to ${orientationNames[action.orientation]}`); observation = await synthesize(`orientation ${action.orientation}`); break;
+        case 'openSettings': note('Open Settings'); observation = await synthesize('', 'com.apple.Preferences'); break;
+        case 'launchApp': note(`Open ${action.bundleId}`); observation = await synthesize('', action.bundleId); break;
       }
       // Xcode observes immediately after the event, often mid-transition. Observe again once the screen is still.
       if (options.settle ?? true) {
@@ -728,6 +767,7 @@ export class AppleHub {
     session.closing = true;
     clearTimeout(session.timer);
     this.video.closeSession(sessionId);
+    for (const [streamId, cursor] of this.activityCursors) if (cursor.sessionId === sessionId) this.activityCursors.delete(streamId);
     const ending = session.queue.then(async () => {
       try { appleToolData(await this.boundary.tool('DeviceInteractionEndSession', { interactionSessionKey: session.key })); }
       finally { this.sessions.delete(sessionId); }

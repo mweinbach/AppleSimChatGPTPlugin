@@ -71,6 +71,8 @@ test("model text lists elements while the raw hierarchy travels only in _meta fo
   assert.equal(JSON.stringify(result.structuredContent).includes("General"), false);
   assert.equal(result._meta?.[HIERARCHY_META_KEY], capture.hierarchy);
   assert.match((captureResult(frame()).content[0] as { text: string }).text, /scale positions/);
+  assert.match((captureResult({ ...capture, settings: { appearance: "dark", textSize: "large", reduceMotion: false } }).content[0] as { text: string }).text, /Settings: appearance dark, textSize large, reduceMotion false\./);
+  assert.equal((captureResult(frame()).content[0] as { text: string }).text.includes("Settings:"), false);
   assert.match((captureResult(frame(false)).content[0] as { text: string }).text, /elements are hidden/);
 });
 

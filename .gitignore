@@ -4,6 +4,7 @@ artifacts/*
 plugins/apple-device-hub/dist/
 packages/apple-device-hub-mcp/dist/
 release/
+.dev-plugin/
 .DS_Store
 .claude/settings.local.json
 .env

@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const { version } = JSON.parse(await readFile(root + "package.json", "utf8"));
-for (const name of ["apple-device-hub-mcp", "apple-sim-chatgpt-plugin"]) {
+for (const name of ["apple-device-hub-mcp"]) {
   const archive = `${root}release/${name}-${version}.tgz`;
   const integrity = spawnSync("npm", ["view", `${name}@${version}`, "dist.integrity", "--json"], { encoding: "utf8" });
   if (integrity.status === 0 && integrity.stdout.trim()) {

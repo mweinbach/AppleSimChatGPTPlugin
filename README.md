@@ -8,22 +8,18 @@ This project targets the ChatGPT/Codex desktop host with local-plugin support an
 
 Requires an Apple Silicon Mac, macOS 14+, Node 22+, and Xcode 27 with **Settings → Intelligence → Model Context Protocol** enabled. Open Xcode before starting a device session. Physical devices must be paired, connected, unlocked, and configured for development.
 
-The standalone MCP server and ChatGPT plugin are separate npm packages:
-
-| Package | Contents | Usage |
-| --- | --- | --- |
-| `apple-device-hub-mcp` | Device tools, MCP App viewer and arm64 native capture helper | Launch from any compatible local MCP client. |
-| `apple-sim-chatgpt-plugin` | Plugin manifest, skills and a bundled copy of the same MCP build | Install into the ChatGPT desktop host. |
-
-Install the plugin with the host's `codex` CLI available on PATH:
+Install the plugin with the `codex` CLI:
 
 ```sh
-npx --yes apple-sim-chatgpt-plugin@latest install
+codex plugin marketplace add mweinbach/AppleSimChatGPTPlugin
+codex plugin add apple-device-hub@apple-device-hub
 ```
 
-The installer keeps a persistent copy under `~/Library/Application Support/AppleSimChatGPTPlugin/<version>` and registers it with the host. Repeat the command to update. The installed plugin starts its bundled server directly, without fetching npm packages. Both packages include a signed arm64 helper for Apple Silicon Macs; users do not compile it themselves.
+Fully quit and reopen the ChatGPT desktop app, then start a new chat. The plugin adds the Apple Device Hub viewer, its MCP server, and skills that teach the agent to test apps on a device. The server is the `apple-device-hub-mcp` npm package of the same version, started with `npx`; the first launch downloads it once. The package includes a signed arm64 capture helper, so nothing is compiled on your Mac.
 
-To use only the MCP server, configure your MCP client with:
+To update, run `codex plugin marketplace upgrade apple-device-hub` and `codex plugin add apple-device-hub@apple-device-hub`, then start a new chat. To uninstall, run `codex plugin remove apple-device-hub@apple-device-hub`. A copy installed with the earlier `npx apple-sim-chatgpt-plugin install` command is removed with `codex plugin remove apple-device-hub@apple-sim-chatgpt-plugin`.
+
+To use only the MCP server in another client, configure it with:
 
 ```json
 {
@@ -36,33 +32,15 @@ To use only the MCP server, configure your MCP client with:
 }
 ```
 
-## Build from source
-
-```sh
-git clone https://github.com/mweinbach/AppleSimChatGPTPlugin.git
-cd AppleSimChatGPTPlugin
-npm ci
-npm run build
-npm run typecheck
-npm test
-```
-
-The MCP runtime is built under `packages/apple-device-hub-mcp/dist`. The build copies that exact runtime into `plugins/apple-device-hub/dist`, alongside the plugin's skills and manifests. It compiles a arm64 native simulator capture helper with the selected Xcode toolchain and bundles the server and browser dependencies. It uses the public npm release `@openai/mcp-extensions@0.1.0`, published September 29, 2026, pinned in the lockfile. See the [official SDK installation guide](https://github.com/openai/mcp-extensions/blob/node-v0.1.0/typescript/README.md).
-
 ## Use in ChatGPT
 
-```sh
-codex plugin marketplace add "$PWD"
-codex plugin add apple-device-hub@apple-device-hub-local
-```
+Open **Apple Device Hub** from navigation or beside a chat, or ask “Open Apple Device Hub.” The CLI and deep links retain the `codex` name because that is the installed host's plugin contract.
 
-After first installation, fully quit and reopen the ChatGPT desktop app to pick up the plugin, then start a new task so its tools load. Open **Apple Device Hub** from navigation or beside a task, or ask “Open Apple Device Hub.” The CLI and deep links retain the `codex` name because that is the installed host's plugin contract.
+If a chat shows **Failed to load** and the desktop logs report `unknown MCP server 'apple-device-hub'`, the chat started before the plugin was installed. Start a new chat; after a first installation, fully quit and reopen the desktop app first.
 
-If an existing task shows **Failed to load** and the desktop logs report `unknown MCP server 'apple-device-hub'`, its MCP configuration predates installation. Navigation can discover the plugin before that task's server list updates. Use a new task after installation; for first installation, fully quit and reopen the desktop app first. This error occurs before the viewer's HTML loads.
+The viewer is built for the side panel, where you watch the agent work and step in when needed. Choose a device from the list; running simulators come first and connect in one click, and a stopped simulator boots. The device then fills the panel. Click or drag the screen to touch it: with simulator video running, touches stream to the simulator as you move and Home responds immediately; otherwise a click or drag is sent as one tap or swipe through Xcode.
 
-Choose a device and connect to start its screen viewer. Tap or drag on the screen to interact. With simulator video running, touches stream to the simulator as you move and Home responds immediately; otherwise a click or drag is sent as one tap or swipe through Xcode. The shadcn/ui workbench keeps device selection and hardware controls beside the live simulator, with **Elements** and **Settings** inspector tabs. Select or hover an element to highlight its actual screen bounds; enable **Inspect** to select an element by clicking the screen, then use **Tap element** to act on its current reference. Search filters the element list by label, role, identifier, or value. Highlights and pointer gestures use logical device points and stay aligned when the viewer is scaled or rotated.
-
-Use the keyboard field, hardware buttons, orientation, and device Settings controls as needed. Device preferences show observed values; an unsupported or unreported setting remains unknown. Disconnect when finished; idle sessions expire after five minutes. **Attach current screen** explicitly adds the current screen and enabled hierarchy to the next message when the host supports image context.
+Every action taken through the tools, by the agent or by you, appears on the live screen as it happens: a mark where it tapped or swiped, and a caption such as `e12 Tap “Settings”`. **Show what the agent sees** overlays the numbered element refs the model acts on, so you can check its narration against the screen; hover an element to name it. The dock below the screen holds Home, Lock, Rotate, typing, that overlay, the **Elements** and **Appearance** panels, and **Attach screen to your next message**. Elements lists the same refs with labels, roles and values, filters them, picks one from the screen, and taps it. Appearance changes light or dark mode, text size, motion, transparency and contrast; it shows observed values, and an unreported setting stays unknown. In a wide panel these sit in a column beside the device. Disconnect when finished; idle sessions expire after five minutes. Attaching a screen adds it and any element list to your next message when the host supports image context.
 
 ### Agent device use
 
@@ -115,6 +93,19 @@ The viewer reads the device's current appearance, Dynamic Type size, motion, tra
 ## Development
 
 ```sh
+git clone https://github.com/mweinbach/AppleSimChatGPTPlugin.git
+cd AppleSimChatGPTPlugin
+npm ci
+npm run build
+npm run typecheck
+npm test
+```
+
+The build compiles the arm64 capture helper with the selected Xcode, bundles the server and viewer into `packages/apple-device-hub-mcp/dist`, and copies that runtime to `plugins/apple-device-hub/dist` for local use. It uses the public npm release `@openai/mcp-extensions@0.1.0`, pinned in the lockfile. See the [official SDK installation guide](https://github.com/openai/mcp-extensions/blob/node-v0.1.0/typescript/README.md).
+
+To try your changes in ChatGPT, run `npm run dev:plugin`, then start a new chat. It rebuilds, installs this checkout's plugin and server as `apple-device-hub@apple-device-hub-dev` in place of the published plugin, and gives each build a distinct version so the host reloads it. Return to the published plugin with `codex plugin remove apple-device-hub@apple-device-hub-dev` and `codex plugin add apple-device-hub@apple-device-hub`.
+
+```sh
 npm run preview
 ```
 
@@ -122,9 +113,7 @@ Open `http://127.0.0.1:4319` for a standalone preview of the same real backend. 
 
 The browser UI uses React, shadcn/ui (Radix Nova), and Tailwind CSS. `components.json` configures the component source under `src/components/ui`. The build bundles React and the compiled CSS into the self-contained MCP HTML resource; no CDN or separate web server is needed in the host. Rebuild and reload the preview to pick up UI changes without restarting the preview backend.
 
-`npm start` runs the local stdio MCP server. The root `.mcp.json` is a project launch configuration; the plugin's portable `mcp.json` and legacy `.mcp.json` launch its bundled runtime. Edit the plugin's root `plugin.json` for listing and review metadata; the build generates its `.codex-plugin/plugin.json` compatibility manifest. Keep server diagnostics on stderr.
-
-The checked-in `apple-device-hub-local` marketplace points at this project's built plugin and is separate from the npm installer's marketplace. For source development updates, rebuild, apply the plugin-creator cachebuster workflow, and reinstall from `apple-device-hub-local`.
+`npm start` runs the local stdio MCP server; the root `.mcp.json` launches it for agents working in this repository. The plugin lives in `plugins/apple-device-hub`: edit its `plugin.json` for listing and review metadata and its `skills/` for agent guidance. The build generates `.codex-plugin/plugin.json` and the npx `.mcp.json` from `plugin.json` and the package version. Keep server diagnostics on stderr.
 
 ## Packages and releases
 
@@ -134,9 +123,9 @@ npm run pack
 npm run verify:packages
 ```
 
-Archives are written to `release/`. Verification extracts each archive outside the checkout, initializes the bundled MCP server, reads its viewer resource, checks all three host entrypoints and 20 tools, verifies the arm64 native architecture and signing, and tests the plugin installer with a fixture CLI. The standalone package contains no plugin manifest or skills. The plugin archive includes both.
+Archives are written to `release/`: the `apple-device-hub-mcp` npm package and `apple-device-hub-<version>.zip`, a self-contained copy of the plugin with its server bundled. Verification extracts each archive outside the checkout, initializes its MCP server, reads the viewer resource, checks all three host entrypoints and 20 tools, and verifies the arm64 native architecture and signing. It also checks that the Git plugin's marketplace, manifests and npx server version match the release, and that it contains no build output.
 
-[CI](.github/workflows/ci.yml) runs type checks, tests, arm64 builds and archive verification on Apple Silicon macOS 26 with Node 22 and Node 24 for pull requests and changes to `main`. [Publish](.github/workflows/publish.yml) repeats release checks on macOS 26 for `v*` tags, requires the tag to match the package version and belong to `main`, publishes both packages with provenance using npm trusted publishing, and creates a GitHub release with archives and SHA-256 checksums. Stable releases use `latest`; prereleases use `next`. See [RELEASING.md](RELEASING.md) for setup and release commands.
+[CI](.github/workflows/ci.yml) runs type checks, tests, arm64 builds and archive verification on Apple Silicon macOS 26 with Node 22 and Node 24 for pull requests and changes to `main`. [Publish](.github/workflows/publish.yml) repeats release checks on macOS 26 for `v*` tags, requires the tag to match the package version and belong to `main`, publishes the MCP package with provenance using npm trusted publishing, and creates a GitHub release with archives and SHA-256 checksums. Stable releases use `latest`; prereleases use `next`. See [RELEASING.md](RELEASING.md) for setup and release commands.
 
 ## Boundaries
 

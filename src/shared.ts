@@ -84,6 +84,16 @@ export type DeviceAction = z.infer<typeof actionSchema>;
 
 const fraction = z.number().finite().min(0).max(1);
 const elapsed = z.number().finite().min(0).max(1000).default(0).describe("Milliseconds since the previous live input event");
+/** A device action performed through MCP tools, shown on the live viewer. Points are logical. */
+export interface DeviceActivity {
+  id: number;
+  at: string;
+  summary: string;
+  ref?: string;
+  point?: { x: number; y: number };
+  to?: { x: number; y: number };
+}
+
 /** Live simulator input; x and y are fractions of the displayed video frame. */
 export const liveInputSchema = z.union([
   z.object({ type: z.enum(["down", "move", "up", "cancel"]), x: fraction, y: fraction, dt: elapsed }),

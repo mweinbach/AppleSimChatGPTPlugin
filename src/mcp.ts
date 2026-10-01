@@ -41,6 +41,9 @@ export function describeCapture(capture: Capture): string {
     `${session.device.name} (${session.device.kind}, ${session.device.runtime}) · session ${session.id}`,
     [capture.bundleId && `App: ${capture.bundleId}`, `Screen: ${coordinateSpace.width}×${coordinateSpace.height} pt`, capture.deviceOrientation && capture.deviceOrientation !== "Unknown" && `Orientation: ${capture.deviceOrientation}`, capture.snapshot !== undefined && `Snapshot: ${capture.snapshot}`].filter(Boolean).join(" · "),
   ];
+  if (capture.settings && Object.keys(capture.settings).length) {
+    lines.push(`Settings: ${Object.entries(capture.settings).map(([name, value]) => `${name} ${value}`).join(", ")}. Restore changed settings when finished.`);
+  }
   const pointsImage = screenshot.width === Math.round(coordinateSpace.width) && screenshot.height === Math.round(coordinateSpace.height);
   lines.push(pointsImage ? "Screenshot pixels are logical points: a pixel position in the image is a tap coordinate." : `Screenshot is ${screenshot.width}×${screenshot.height} px; scale positions to the ${coordinateSpace.width}×${coordinateSpace.height} pt coordinate space before tapping.`);
   if (capture.elements) {

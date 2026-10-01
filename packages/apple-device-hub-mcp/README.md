@@ -10,10 +10,11 @@ Configure an MCP client to launch:
 { "mcpServers": { "apple-device-hub": { "command": "npx", "args": ["--yes", "apple-device-hub-mcp@latest"] } } }
 ```
 
-For ChatGPT navigation, sidebar integration and skills, install the separate plugin:
+For ChatGPT navigation, sidebar integration and agent skills, install the plugin, which runs this package:
 
 ```sh
-npx --yes apple-sim-chatgpt-plugin@latest install
+codex plugin marketplace add mweinbach/AppleSimChatGPTPlugin
+codex plugin add apple-device-hub@apple-device-hub
 ```
 
 Source, tool documentation and validation: [AppleSimChatGPTPlugin](https://github.com/mweinbach/AppleSimChatGPTPlugin).

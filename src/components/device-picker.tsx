@@ -1,45 +1,93 @@
-import { RefreshCw, Smartphone, Tablet, LoaderCircle } from "lucide-react";
-import { Badge } from "./ui/badge.js";
+import { useState } from "react";
+import { ChevronDown, ChevronRight, LoaderCircle, RefreshCw, Smartphone, Tablet, TriangleAlert, Watch } from "lucide-react";
+import { Alert, AlertDescription, AlertTitle } from "./ui/alert.js";
 import { Button } from "./ui/button.js";
-import { Field, FieldLabel } from "./ui/field.js";
-import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue } from "./ui/select.js";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip.js";
-import { scanDevices, selectDevice, setSettingsOpen, toggleConnection, type ViewerState } from "../viewer-controller.js";
+import type { Device } from "../shared.js";
+import { connectDevice, scanDevices, toggleConnection, type ViewerState } from "../viewer-controller.js";
 
-export function DevicePicker({ state }: { state: ViewerState }) {
-  const device = state.session?.device ?? state.hub.devices.find(item => item.id === state.selectedDeviceId);
-  const available = state.hub.devices.filter(item => item.available).sort((left, right) => Number(right.state.toLowerCase() === "booted") - Number(left.state.toLowerCase() === "booted") || left.name.localeCompare(right.name));
-  // Retain the active device if it disappears from a discovery refresh.
-  if (state.session && !available.some(item => item.id === device?.id)) available.unshift(state.session.device);
-  const groups = [
-    { label: "Simulators", devices: available.filter(item => item.kind === "simulator") },
-    { label: "Connected devices", devices: available.filter(item => item.kind === "device") },
-  ];
+export function deviceForm(device?: Pick<Device, "name">): "phone" | "tablet" | "watch" {
+  if (!device) return "phone";
+  if (/\biPad\b/i.test(device.name)) return "tablet";
+  if (/\bWatch\b/i.test(device.name)) return "watch";
+  return "phone";
+}
+
+function DeviceIcon({ device }: { device?: Pick<Device, "name"> }) {
+  const form = deviceForm(device);
+  return form === "tablet" ? <Tablet /> : form === "watch" ? <Watch /> : <Smartphone />;
+}
+
+const running = (device: Device) => device.state.toLowerCase() === (device.kind === "simulator" ? "booted" : "connected");
+const formOrder = { phone: 0, tablet: 1, watch: 2 };
+const version = (device: Device) => (device.runtime.match(/[\d.]+$/)?.[0] ?? "0").split(".").map(Number);
+/** iPhones first, then iPads and watches; newest runtime first within each. */
+function compareSimulators(left: Device, right: Device) {
+  const form = formOrder[deviceForm(left)] - formOrder[deviceForm(right)];
+  if (form) return form;
+  const [a, b] = [version(left), version(right)];
+  for (let index = 0; index < Math.max(a.length, b.length); index++) if ((a[index] ?? 0) !== (b[index] ?? 0)) return (b[index] ?? 0) - (a[index] ?? 0);
+  return left.name.localeCompare(right.name);
+}
+
+/** The connected device's identity, or the list's title before connecting. */
+export function DeviceBar({ state }: { state: ViewerState }) {
+  const device = state.session?.device;
   const disabled = !state.initialized || state.busy || state.ended;
-  const loading = !state.initialized || (state.busy && !state.hub.devices.length);
-  const DeviceIcon = device?.name.startsWith("iPad") ? Tablet : Smartphone;
-
-  return <section className="connection-bar" aria-label="Device connection">
-    <DeviceIcon className="connection-device-icon" aria-hidden="true" />
-    <Field className="device-field">
-      <FieldLabel htmlFor="devices" className="sr-only">Device</FieldLabel>
-      <Select value={state.selectedDeviceId} onValueChange={selectDevice} disabled={disabled || Boolean(state.session)} onOpenChange={setSettingsOpen}>
-        <SelectTrigger id="devices" className="w-full"><SelectValue placeholder={loading ? "Loading devices…" : available.length ? "Choose a device…" : "No devices available"}>{device?.name}</SelectValue></SelectTrigger>
-        <SelectContent position="popper" align="start">
-          {groups.filter(group => group.devices.length).map(group => <SelectGroup key={group.label}>
-            <SelectLabel>{group.label}</SelectLabel>
-            {group.devices.map(item => <SelectItem key={item.id} value={item.id}>{item.name}<span className="device-option-meta">{item.runtime || item.platform}{item.state.toLowerCase() === "booted" ? " · Running" : ""}</span></SelectItem>)}
-          </SelectGroup>)}
-        </SelectContent>
-      </Select>
-    </Field>
-    {device && <span id="device-details" className="device-runtime">{device.runtime || device.platform}<span className="device-kind">{device.kind === "simulator" ? "Simulator" : "Physical device"}</span></span>}
-    <div className="connection-actions">
-      <Badge variant={state.session ? "secondary" : "outline"} className="connection-badge"><span className="status-dot" data-connected={Boolean(state.session)} />{state.session ? "Connected" : "Disconnected"}</Badge>
-      <Tooltip><TooltipTrigger asChild><Button id="scan" variant="ghost" size="icon" disabled={disabled} onClick={() => void scanDevices()} aria-label="Refresh device list"><RefreshCw /></Button></TooltipTrigger><TooltipContent>Refresh device list</TooltipContent></Tooltip>
-      <Button id="connection" variant={state.session ? "outline" : "default"} disabled={disabled || (!state.session && !state.selectedDeviceId)} onClick={() => void toggleConnection()}>
-        {state.busy && !state.capture && <LoaderCircle className="animate-spin" data-icon="inline-start" />}{state.session ? "Disconnect" : "Connect"}
-      </Button>
+  if (!device) {
+    return <header className="device-bar">
+      <h1 className="device-bar-title">Choose a device</h1>
+      <Tooltip><TooltipTrigger asChild><Button id="scan" variant="ghost" size="icon-sm" className="device-bar-end" disabled={disabled} onClick={() => void scanDevices()} aria-label="Refresh device list"><RefreshCw /></Button></TooltipTrigger><TooltipContent>Refresh device list</TooltipContent></Tooltip>
+    </header>;
+  }
+  const live = state.videoReady || (state.capture && !state.busy);
+  return <header className="device-bar">
+    <span className="device-bar-icon" aria-hidden="true"><DeviceIcon device={device} /></span>
+    <div className="device-identity">
+      <h1 className="device-name" title={device.name}>{device.name}</h1>
+      <p className="device-meta"><span className="status-dot" data-state={live ? "live" : "waiting"} aria-hidden="true" />{device.runtime || device.platform}<span aria-hidden="true">·</span>{device.kind === "simulator" ? "Simulator" : "Device"}</p>
     </div>
-  </section>;
+    <Button id="connection" variant="ghost" size="sm" className="device-bar-end" disabled={disabled} onClick={() => void toggleConnection()}>Disconnect</Button>
+  </header>;
+}
+
+function DeviceRow({ device, state }: { device: Device; state: ViewerState }) {
+  const connecting = state.busy && state.selectedDeviceId === device.id;
+  const status = !device.available ? "Unavailable" : running(device) ? "Running" : device.kind === "simulator" ? "Starts when connected" : "Not connected";
+  return <li>
+    <button type="button" className="device-row" data-running={running(device)} disabled={!device.available || state.busy || !state.initialized} aria-busy={connecting} onClick={() => void connectDevice(device.id)}>
+      <span className="device-row-icon" aria-hidden="true"><DeviceIcon device={device} /></span>
+      <span className="device-row-copy">
+        <span className="device-row-name">{device.name}</span>
+        <span className="device-row-meta">{device.runtime || device.platform}<span aria-hidden="true"> · </span>{running(device) && <span className="status-dot" data-state="live" aria-hidden="true" />}{status}</span>
+      </span>
+      <span className="device-row-action">{connecting ? <><LoaderCircle className="animate-spin" aria-hidden="true" />{device.kind === "simulator" && !running(device) ? "Starting…" : "Connecting…"}</> : <>Connect<ChevronRight aria-hidden="true" /></>}</span>
+    </button>
+  </li>;
+}
+
+/** Shown in place of the screen until a device is connected. */
+export function DeviceChooser({ state }: { state: ViewerState }) {
+  const [showAll, setShowAll] = useState(false);
+  const devices = [...state.hub.devices].sort((left, right) => Number(running(right)) - Number(running(left)) || compareSimulators(left, right));
+  const active = devices.filter(device => running(device) && device.available);
+  const simulators = devices.filter(device => device.kind === "simulator" && !active.includes(device));
+  const physical = devices.filter(device => device.kind === "device" && !active.includes(device));
+  const shown = showAll ? simulators : simulators.filter(device => device.available).slice(0, active.length ? 4 : 8);
+  const loading = !state.initialized || (state.busy && !state.hub.devices.length);
+  return <div className="chooser" aria-busy={loading}>
+    {state.noticeError && <Alert variant="destructive"><TriangleAlert /><AlertTitle>Could not connect</AlertTitle><AlertDescription>{state.notice}</AlertDescription></Alert>}
+    {state.hub.warnings.length > 0 && <Alert><TriangleAlert /><AlertTitle>Some devices could not be listed</AlertTitle><AlertDescription>{state.hub.warnings.map(warning => <p key={warning}>{warning}</p>)}</AlertDescription></Alert>}
+    {loading ? <ul className="device-list" aria-label="Loading devices">{[0, 1, 2].map(index => <li key={index} className="device-row-skeleton" />)}</ul> : <>
+      {active.length > 0 && <section className="device-group" aria-labelledby="running-heading"><h2 id="running-heading">Running</h2><ul className="device-list">{active.map(device => <DeviceRow key={device.id} device={device} state={state} />)}</ul></section>}
+      {simulators.length > 0 && <section className="device-group" aria-labelledby="simulators-heading">
+        <h2 id="simulators-heading">{active.length ? "Other simulators" : "Simulators"}</h2>
+        <ul className="device-list">{shown.map(device => <DeviceRow key={device.id} device={device} state={state} />)}</ul>
+        {shown.length < simulators.length && <Button variant="ghost" size="sm" className="device-more" onClick={() => setShowAll(true)}>Show all {simulators.length}<ChevronDown data-icon="inline-end" /></Button>}
+      </section>}
+      {physical.length > 0 && <section className="device-group" aria-labelledby="physical-heading"><h2 id="physical-heading">Physical devices</h2><ul className="device-list">{physical.map(device => <DeviceRow key={device.id} device={device} state={state} />)}</ul></section>}
+      {!devices.length && <p className="chooser-empty">No simulators or devices found. Install a simulator runtime in Xcode, or connect and unlock a paired device, then refresh.</p>}
+    </>}
+    <p className="chooser-note">Device Hub uses Xcode on this Mac. Keep Xcode open with <strong>Settings → Intelligence → Model Context Protocol</strong> turned on.</p>
+  </div>;
 }

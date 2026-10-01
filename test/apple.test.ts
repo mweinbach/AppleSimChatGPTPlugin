@@ -645,6 +645,28 @@ test('live stream reads run alongside input and prevent idle expiry while pendin
   assert.deepEqual(stops, [[session.id, 'live-stream']]);
 });
 
+test('device activity reaches each live viewer once and never repeats typed text', async (t) => {
+  const video = new SimulatorVideo();
+  video.stream = async (sessionId) => ({ sessionId, streamId: 'a'.repeat(48), url: 'ws://127.0.0.1:1/video/test', format: 'h264', codec: 'avc1.42E01F', fps: 60 });
+  let sequence = 0;
+  video.read = async (sessionId, streamId) => ({ sessionId, streamId, sequence: sequence++, frames: [], active: true });
+  const f = await fixture(t, 60_000, video);
+  await writeFile(f.hierarchyPath, settingsHierarchy);
+  const session = await f.hub.connect('sim-1');
+  const general = (await f.hub.capture(session.id)).elements!.find(element => element.label === 'General')!;
+  await f.hub.action(session.id, { type: 'tap', x: 10, y: 20 }, { settle: false });
+  const stream = await f.hub.stream(session.id);
+  await f.hub.action(session.id, { type: 'tap', element: { ref: general.ref } }, { settle: false });
+  await f.hub.action(session.id, { type: 'type', text: 'correct horse battery' }, { settle: false });
+  const batch = await f.hub.streamRead(session.id, stream.streamId!);
+  assert.deepEqual(batch.activity?.map(item => ({ summary: item.summary, ref: item.ref, point: item.point })), [
+    { summary: 'Tap “General”', ref: general.ref, point: general.point },
+    { summary: 'Type text', ref: undefined, point: undefined },
+  ], 'actions from before the stream started are not replayed');
+  assert.equal(JSON.stringify(batch).includes('horse'), false);
+  assert.equal((await f.hub.streamRead(session.id, stream.streamId!)).activity, undefined, 'each action is delivered once');
+});
+
 test('live stream reads guard simulator ownership and reject results after disconnect', async (t) => {
   const video = new SimulatorVideo();
   let reads = 0;

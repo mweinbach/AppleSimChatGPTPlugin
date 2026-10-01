@@ -2,7 +2,7 @@ import { App } from "@modelcontextprotocol/ext-apps";
 import { version } from "./version.js";
 import { applyDocumentTheme, applyHostStyleVariables } from "@modelcontextprotocol/ext-apps/app-with-deps";
 import { OpenAIExtensions, OPENAI_MODEL_CONTEXT_KEY } from "@openai/mcp-extensions/app";
-import { HIERARCHY_META_KEY, sessionSchema, type CaptureState, type DeviceAction, type DeviceSettings, type HubState, type LiveInput, type Session } from "./shared.js";
+import { HIERARCHY_META_KEY, sessionSchema, type CaptureState, type DeviceAction, type DeviceActivity, type DeviceSettings, type HubState, type LiveInput, type Session } from "./shared.js";
 import { screenToDevicePoint } from "./screen-mapping.js";
 import { coordinateSpaceMatchesFrame, SimulatorVideoPlayer, type SimulatorStream, type SimulatorVideoTransport } from "./video-player.js";
 import { preferredVideoCodec, type VideoCodec } from "./video-codec.js";
@@ -72,6 +72,9 @@ let liveInputAt: number | undefined;
 let liveInputError: string | undefined;
 let renderedAt: number[] = [];
 let fpsLabelAt = 0;
+let videoFps: number | undefined;
+let videoCodec: "HEVC" | "H.264" | undefined;
+let activity: DeviceActivity | undefined;
 
 export interface ViewerState {
   hub: HubState;
@@ -85,6 +88,11 @@ export interface ViewerState {
   videoReady: boolean;
   /** Touches and Home go straight to the simulator instead of through Xcode. */
   liveInput: boolean;
+  /** Frames drawn in the last second; 0 while the screen is still, undefined without live video. */
+  videoFps?: number;
+  videoCodec?: "HEVC" | "H.264";
+  /** The latest action taken through MCP tools, by the model or the viewer. */
+  activity?: DeviceActivity;
   videoDimensions?: { width: number; height: number };
   videoMessage: string;
   videoError: boolean;
@@ -106,7 +114,7 @@ export const subscribe = (listener: () => void) => { listeners.add(listener); re
 export const getSnapshot = () => snapshot;
 
 function publish(patch: Partial<ViewerState> = {}) {
-  snapshot = { ...snapshot, hub, session, capture, selectedDeviceId, initialized, busy, ended, liveEnabled, videoReady, liveInput: liveInputReady(), videoDimensions, settings: observedSettings, contextEnabled, ...patch };
+  snapshot = { ...snapshot, hub, session, capture, selectedDeviceId, initialized, busy, ended, liveEnabled, videoReady, liveInput: liveInputReady(), videoFps, videoCodec, activity, videoDimensions, settings: observedSettings, contextEnabled, ...patch };
   listeners.forEach(listener => listener());
 }
 
@@ -172,6 +180,7 @@ function stopVideo(reset = false) {
   videoDimensions = undefined;
   videoRequestedDimension = undefined;
   renderedAt = [];
+  videoFps = videoCodec = undefined;
   // The helper lifts a held touch when its video stops.
   if (liveTouch) gestureMark.hidden = true;
   liveTouch = undefined;
@@ -217,6 +226,16 @@ function stopVideoStream(stream: SimulatorStream) {
   if (stream.streamId) void callTool("device_stream_stop", { sessionId: stream.sessionId, streamId: stream.streamId }).catch(() => {});
 }
 
+function receiveActivity(sessionId: string, items: unknown[]) {
+  const point = (value: unknown) => value === undefined || (typeof value === "object" && value !== null && Number.isFinite((value as { x?: unknown }).x) && Number.isFinite((value as { y?: unknown }).y));
+  const latest = items.filter((item): item is DeviceActivity => typeof item === "object" && item !== null
+    && Number.isInteger((item as DeviceActivity).id) && typeof (item as DeviceActivity).summary === "string"
+    && point((item as DeviceActivity).point) && point((item as DeviceActivity).to)).at(-1);
+  if (!latest || session?.id !== sessionId) return;
+  activity = latest;
+  publish();
+}
+
 function decodeBase64(value: string) {
   const binary = atob(value);
   const bytes = new Uint8Array(binary.length);
@@ -236,11 +255,12 @@ function videoTransport(stream: SimulatorStream): SimulatorVideoTransport {
     async read() {
       const result = await callTool("device_stream_read", { sessionId: stream.sessionId, streamId: stream.streamId });
       if (stopped) return [];
-      const batch = result._meta?.["apple-device-hub/video"] as { sessionId?: string; streamId?: string; sequence?: unknown; frames?: unknown; active?: boolean } | undefined;
+      const batch = result._meta?.["apple-device-hub/video"] as { sessionId?: string; streamId?: string; sequence?: unknown; frames?: unknown; active?: boolean; activity?: unknown } | undefined;
       if (!batch || batch.sessionId !== stream.sessionId || batch.streamId !== stream.streamId || batch.active !== true || !Array.isArray(batch.frames) || !batch.frames.every(frame => typeof frame === "string")) throw new Error("Device Hub returned an incomplete video batch.");
       // A lost or repeated batch breaks the decoder's reference chain.
       if (batch.sequence !== sequence) throw new Error("Device Hub video batches arrived out of order.");
       sequence++;
+      if (Array.isArray(batch.activity)) receiveActivity(stream.sessionId, batch.activity);
       return (batch.frames as string[]).map(decodeBase64);
     },
     stop() {
@@ -314,7 +334,9 @@ async function startVideo() {
       while (renderedAt[0]! < now - 1000) renderedAt.shift();
       if (firstFrame || now - fpsLabelAt >= 1000) {
         fpsLabelAt = now;
-        videoStatus(`Live video · ${stream.format === "hevc" ? "HEVC" : "H.264"} · ${renderedAt.length >= 5 ? `${renderedAt.length} fps` : "idle"}`);
+        videoFps = renderedAt.length >= 5 ? renderedAt.length : 0;
+        videoCodec = stream.format === "hevc" ? "HEVC" : "H.264";
+        videoStatus(`Live video · ${videoCodec} · ${videoFps ? `${videoFps} fps` : "idle"}`);
         const outgrown = liveTouch ? undefined : outgrownVideoDimension(dimensions);
         if (outgrown) {
           // The restart measures the still, which can lag a rotation; keep the size measured from the live frame.
@@ -523,6 +545,7 @@ function selectSession(next: Session) {
     stopVideo(true);
     resetStream();
     resetLiveInput();
+    activity = undefined;
     capture = undefined;
     screenImage = undefined;
     pointerStart = undefined;
@@ -544,6 +567,7 @@ function clearSession() {
   stopVideo(true);
   resetStream();
   resetLiveInput();
+  activity = undefined;
   stopPolling();
   session = undefined;
   capture = undefined;
@@ -747,6 +771,13 @@ function receiveResult(result: ToolResult) {
 }
 
 export function selectDevice(id: string) { selectedDeviceId = id; publish(); }
+
+/** Connects a device chosen from the device list in one step. */
+export async function connectDevice(id: string) {
+  if (session || busy) return;
+  selectedDeviceId = id;
+  await toggleConnection();
+}
 
 export async function toggleConnection() {
   await run(async () => {

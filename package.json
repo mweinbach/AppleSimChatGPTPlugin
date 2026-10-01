@@ -16,7 +16,8 @@
     "preview": "node plugins/apple-device-hub/dist/server.js --preview",
     "pack": "node scripts/pack.mjs",
     "verify:packages": "node scripts/verify-packages.mjs",
-    "version": "node scripts/sync-version.mjs && git add packages/apple-device-hub-mcp/package.json plugins/apple-device-hub/package.json plugins/apple-device-hub/plugin.json plugins/apple-device-hub/.codex-plugin/plugin.json"
+    "dev:plugin": "node scripts/dev-plugin.mjs",
+    "version": "node scripts/sync-version.mjs && git add packages/apple-device-hub-mcp/package.json plugins/apple-device-hub/plugin.json plugins/apple-device-hub/.codex-plugin/plugin.json plugins/apple-device-hub/.mcp.json"
   },
   "dependencies": {
     "@modelcontextprotocol/ext-apps": "1.7.5",

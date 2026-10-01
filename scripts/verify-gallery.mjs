@@ -40,6 +40,7 @@ try {
   assert.equal(configuration.command, "node");
   assert.equal(configuration.cwd, "./");
   assert.deepEqual(configuration.args, ["./dist/server.js"]);
+  assert.deepEqual(JSON.parse(await readFile(join(directory, ".mcp.json"), "utf8")).mcpServers["apple-device-hub"].args, ["./dist/server.js"], "The ZIP's Codex overlay also runs its bundled server");
   const transport = new StdioClientTransport({ command: process.execPath, args: configuration.args.map(arg => resolve(directory, arg)), cwd: resolve(directory, configuration.cwd), stderr: "pipe" });
   const client = new Client({ name: "gallery-package-verification", version: "1" });
   try {

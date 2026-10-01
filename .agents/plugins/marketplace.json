@@ -1,7 +1,7 @@
 {
-  "name": "apple-device-hub-local",
+  "name": "apple-device-hub",
   "interface": {
-    "displayName": "Apple Device Hub Local"
+    "displayName": "Apple Device Hub"
   },
   "plugins": [
     {

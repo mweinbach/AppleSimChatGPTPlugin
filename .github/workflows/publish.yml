@@ -44,7 +44,7 @@ jobs:
       - run: npm test
       - run: npm run pack
       - run: npm run verify:packages
-      - name: Publish both packages using npm trusted publishing
+      - name: Publish the MCP package using npm trusted publishing
         run: node scripts/publish.mjs
       - name: Create GitHub release with package archives and checksums
         env:
