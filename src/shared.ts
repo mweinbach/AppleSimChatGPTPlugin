@@ -35,10 +35,15 @@ export interface Screenshot {
   height: number;
 }
 
+/** "auto" attaches an image only when the element list cannot describe the screen. */
+export const screenshotModeSchema = z.enum(["auto", "always", "never"]);
+export type ScreenshotMode = z.infer<typeof screenshotModeSchema>;
+
 export interface Capture {
   session: Session;
   capturedAt: string;
-  screenshot: Screenshot;
+  /** Absent when the caller's screenshot mode left the image out. */
+  screenshot?: Screenshot;
   coordinateSpace: { width: number; height: number };
   hierarchy?: string;
   applicationState?: string;
@@ -51,7 +56,7 @@ export interface Capture {
 }
 
 export type CaptureState = Omit<Capture, "screenshot" | "elements"> & {
-  screenshot: Omit<Screenshot, "data">;
+  screenshot?: Omit<Screenshot, "data">;
 };
 
 const point = z.number().finite().nonnegative();

@@ -14,7 +14,9 @@ test("computer targets support CUA coordinates, indices, refs and accessibility 
 
 test("simulator input is scoped and carries snapshot checks into the serial queue", () => {
   const result = computerAction("simulator_click", { sessionId, target: 12, snapshot: 4, clickCount: 2, settle: false });
-  assert.deepEqual(result, { sessionId, action: { type: "tap", element: { ref: "e12" }, clickCount: 2 }, options: { simulatorOnly: true, accessibilityEnabled: true, snapshot: 4, settle: false } });
+  assert.deepEqual(result, { sessionId, action: { type: "tap", element: { ref: "e12" }, clickCount: 2 }, options: { simulatorOnly: true, accessibilityEnabled: true, screenshot: "auto", snapshot: 4, settle: false } });
+  assert.equal(computerAction("simulator_click", { sessionId, target: [20, 30], screenshot: "always" }).options.screenshot, "always");
+  assert.equal(computerInputs.simulator_click.safeParse({ sessionId, target: [20, 30], screenshot: "sometimes" }).success, false);
   assert.deepEqual(computerAction("simulator_type_text", { sessionId, target: [20, 30], text: "literal\\n🙂" }).action,
     { type: "type", x: 20, y: 30, text: "literal\\n🙂" });
   assert.deepEqual(computerAction("simulator_drag", { sessionId, from: [20, 100], to: [20, 30] }).action,

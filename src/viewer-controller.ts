@@ -615,7 +615,7 @@ async function captureCurrent(epoch = lifecycle, accessibilityEnabled?: boolean)
   const current = session;
   const generation = frameGeneration;
   if (!current || epoch !== lifecycle || ended) return;
-  const result = await callTool("device_capture", { sessionId: current.id, resolution: "full", ...(accessibilityEnabled === undefined ? {} : { accessibilityEnabled }) });
+  const result = await callTool("device_capture", { sessionId: current.id, resolution: "full", screenshot: "always", ...(accessibilityEnabled === undefined ? {} : { accessibilityEnabled }) });
   if (generation !== frameGeneration) return;
   applyCapture(result, epoch);
 }
@@ -648,7 +648,7 @@ async function streamFrame(current: Session) {
   const settle = staleSince !== undefined && (lastFrameUnchanged || Date.now() - staleSince > 5000);
   streaming = true;
   try {
-    const result = await callTool(settle ? "device_capture" : "device_frame", settle ? { sessionId: current.id, resolution: "full" } : { sessionId: current.id });
+    const result = await callTool(settle ? "device_capture" : "device_frame", settle ? { sessionId: current.id, resolution: "full", screenshot: "always" } : { sessionId: current.id });
     const image = result.content.find(item => item.type === "image");
     if (image?.type === "image") {
       // Decode off-screen first so swapping the visible image never flashes.
@@ -686,7 +686,7 @@ export async function performAction(action: DeviceAction) {
   const epoch = lifecycle;
   return run(async () => {
     // The live stream shows animations, so the viewer skips the agent-oriented idle wait.
-    const result = await callTool("device_action", { sessionId: current.id, action, settle: false, resolution: "full" });
+    const result = await callTool("device_action", { sessionId: current.id, action, settle: false, resolution: "full", screenshot: "always" });
     applyCapture(result, epoch);
   }, action.type === "openSettings" ? "Opening Settings…" : "Updating device…");
 }
@@ -696,7 +696,7 @@ export async function changeSettings(settings: DeviceSettings) {
   const current = session;
   const epoch = lifecycle;
   return run(async () => {
-    const result = await callTool("device_settings", { sessionId: current.id, settings, resolution: "full" });
+    const result = await callTool("device_settings", { sessionId: current.id, settings, resolution: "full", screenshot: "always" });
     applyCapture(result, epoch);
   }, "Applying device settings…");
 }
@@ -704,6 +704,12 @@ export async function changeSettings(settings: DeviceSettings) {
 function applyTheme(context: ReturnType<App["getHostContext"]>) {
   if (context?.theme) applyDocumentTheme(context.theme);
   if (context?.styles?.variables) applyHostStyleVariables(context.styles.variables);
+  // ChatGPT reports its floating composer as a bottom inset; controls must stay clear of it.
+  if (context?.safeAreaInsets) {
+    for (const side of ["top", "right", "bottom", "left"] as const) {
+      document.documentElement.style.setProperty(`--safe-${side}`, `${Math.max(0, context.safeAreaInsets[side] ?? 0)}px`);
+    }
+  }
 }
 
 function syncAttachment() {

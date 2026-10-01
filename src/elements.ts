@@ -153,7 +153,7 @@ export function formatElement(element: ScreenElement): string {
   if (element.value) parts.push(`value=${quote(element.value, 40)}`);
   if (element.placeholder) parts.push(`placeholder=${quote(element.placeholder, 40)}`);
   for (const flag of ['selected', 'disabled', 'focused'] as const) if (element[flag]) parts.push(flag);
-  parts.push(`@ ${element.point.x},${element.point.y}`);
+  parts.push(`@ ${element.point.x},${element.point.y}`, `${Math.round(element.frame.width)}×${Math.round(element.frame.height)}`);
   return parts.join(' ');
 }
 

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { elementTargetSchema, type DeviceAction, type ElementTarget } from "./shared.js";
+import { elementTargetSchema, screenshotModeSchema, type DeviceAction, type ElementTarget, type ScreenshotMode } from "./shared.js";
 
 const point = z.number().finite().nonnegative();
 /** Coordinates and numeric element indices follow the simulator's current observation. */
@@ -12,13 +12,14 @@ export const computerTargetSchema = z.union([
 export type ComputerTarget = z.infer<typeof computerTargetSchema>;
 
 const sessionId = z.string().uuid();
+export const screenshotOption = screenshotModeSchema.default("auto").describe("\"auto\" attaches a screenshot only when the element list cannot describe the screen; \"always\" attaches one for visual checks; \"never\" returns text only.");
 const snapshot = z.number().int().positive().optional().describe("Snapshot from simulator_get_state; required when using an element number or ref. Stale snapshots are rejected before input.");
 const actionOptions = {
-  sessionId, snapshot,
-  settle: z.boolean().optional().describe("Wait for animations before returning the resulting screenshot and accessibility state (default true)."),
+  sessionId, snapshot, screenshot: screenshotOption,
+  settle: z.boolean().optional().describe("Wait for animations before returning the resulting screen and accessibility state (default true)."),
 };
 export const computerInputs = {
-  simulator_get_state: z.object({ sessionId }),
+  simulator_get_state: z.object({ sessionId, screenshot: screenshotOption }),
   simulator_screenshot: z.object({ sessionId }),
   simulator_click: z.object({ ...actionOptions, target: computerTargetSchema, clickCount: z.union([z.literal(1), z.literal(2)]).default(1), duration: z.number().min(0.1).max(5).optional().describe("Hold duration in seconds for a long press; omit for an ordinary click.") })
     .refine(value => value.clickCount === 1 || value.duration === undefined, "A double click cannot also be a long press."),
@@ -39,10 +40,10 @@ export function computerTarget(target: ComputerTarget, snapshot?: number): { x: 
 export function computerAction(name: ComputerToolName, args: unknown): {
   sessionId: string;
   action: DeviceAction;
-  options: { simulatorOnly: true; accessibilityEnabled: true; snapshot?: number; settle?: boolean };
+  options: { simulatorOnly: true; accessibilityEnabled: true; screenshot: ScreenshotMode; snapshot?: number; settle?: boolean };
 } {
   const input = z.object(actionOptions).parse(args);
-  const options = { simulatorOnly: true as const, accessibilityEnabled: true as const, ...(input.snapshot !== undefined ? { snapshot: input.snapshot } : {}), ...(input.settle !== undefined ? { settle: input.settle } : {}) };
+  const options = { simulatorOnly: true as const, accessibilityEnabled: true as const, screenshot: input.screenshot, ...(input.snapshot !== undefined ? { snapshot: input.snapshot } : {}), ...(input.settle !== undefined ? { settle: input.settle } : {}) };
   let action: DeviceAction;
   switch (name) {
     case "simulator_click": {

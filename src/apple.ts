@@ -7,13 +7,21 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import { resolveElement, summarizeHierarchy, type Rect, type ScreenElement } from './elements.js';
-import { actionSchema, settingsSchema, textSizeSchema, type Capture, type Device, type DeviceAction, type DeviceActivity, type DeviceSettings, type ElementTarget, type HubState, type LiveInput, type Session } from './shared.js';
+import { actionSchema, settingsSchema, textSizeSchema, type Capture, type Device, type DeviceAction, type DeviceActivity, type DeviceSettings, type ElementTarget, type HubState, type LiveInput, type ScreenshotMode, type Session } from './shared.js';
 import { SimulatorVideo, type VideoBatch, type VideoStream } from './video.js';
+
+/** Xcode answers ordinary requests in well under a second. */
+const XCODE_TIMEOUT_MS = 40_000;
+/** The first observation of a shut-down simulator boots it. Codex allows tools 300 s. */
+const BOOT_TIMEOUT_MS = 100_000;
+/** Ordinary requests return within MCP clients' common 60 s request timeout, even behind a stuck one. */
+const OPERATION_DEADLINE_MS = 55_000;
 
 export interface AppleBoundary {
   command(args: string[], timeoutMs?: number): Promise<string>;
-  tool(name: string, args: Record<string, unknown>): Promise<unknown>;
+  tool(name: string, args: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
   /** Re-encodes a screenshot as a JPEG no larger than maxEdge pixels on its long side. */
   compress?(input: string, output: string, maxEdge: number): Promise<void>;
   close(): Promise<void>;
@@ -45,11 +53,13 @@ export class NativeAppleBoundary implements AppleBoundary {
         const transport = new StdioClientTransport({ command: '/usr/bin/xcrun', args: ['mcpbridge'], stderr: 'pipe' });
         transport.stderr?.on('data', (chunk: Buffer) => { this.stderr = (this.stderr + chunk.toString()).slice(-4000); });
         try {
-          await client.connect(transport);
+          await client.connect(transport, { timeout: 60_000 });
           return client;
         } catch (error) {
           await transport.close();
-          throw new Error(`Could not connect to Xcode MCP. Enable Xcode Settings > Intelligence > Model Context Protocol, then retry. ${this.stderr || String(error)}`);
+          throw new Error(timedOut(error)
+            ? 'Xcode did not accept the connection. If Xcode is asking whether to allow access, choose Allow; otherwise turn on Xcode Settings > Intelligence > Model Context Protocol, then retry.'
+            : `Could not connect to Xcode MCP. Turn on Xcode Settings > Intelligence > Model Context Protocol, then retry. ${this.stderr || String(error)}`);
         }
       })();
     }
@@ -61,8 +71,14 @@ export class NativeAppleBoundary implements AppleBoundary {
     }
   }
 
-  async tool(name: string, args: Record<string, unknown>): Promise<unknown> {
-    return (await this.connect()).callTool({ name, arguments: args }, undefined, { timeout: 120_000 });
+  async tool(name: string, args: Record<string, unknown>, timeoutMs = XCODE_TIMEOUT_MS): Promise<unknown> {
+    const client = await this.connect();
+    try {
+      return await client.callTool({ name, arguments: args }, undefined, { timeout: timeoutMs });
+    } catch (error) {
+      if (timedOut(error)) throw new Error(`Xcode did not answer within ${timeoutMs / 1000} s. Make sure Xcode is open and not showing a dialog, then try again.`);
+      throw error;
+    }
   }
 
   async close(): Promise<void> {
@@ -71,6 +87,8 @@ export class NativeAppleBoundary implements AppleBoundary {
     if (pending) await (await pending).close();
   }
 }
+
+const timedOut = (error: unknown) => error instanceof McpError && error.code === ErrorCode.RequestTimeout;
 
 type ObjectValue = Record<string, any>;
 
@@ -243,6 +261,8 @@ const buttonNames = { home: 'Home', lock: 'Lock', volumeUp: 'Volume Up', volumeD
 export type Resolution = 'points' | 'full';
 export interface CaptureOptions {
   resolution?: Resolution;
+  /** Defaults to "always"; agents pass "auto" to rely on the element list. */
+  screenshot?: ScreenshotMode;
   accessibilityEnabled?: boolean;
   /** Computer-use observations can request AX without changing the viewer preference. */
   updateAccessibilityPreference?: boolean;
@@ -257,6 +277,8 @@ export interface ActionOptions extends CaptureOptions {
 export interface AppleHubOptions {
   boundary?: AppleBoundary;
   idleTimeoutMs?: number;
+  /** How long a request may wait on a device before it returns an error. */
+  operationDeadlineMs?: number;
   video?: SimulatorVideo;
 }
 
@@ -271,6 +293,7 @@ export class SessionExpiredError extends Error {
 export class AppleHub {
   private readonly boundary: AppleBoundary;
   private readonly idleTimeoutMs: number;
+  private readonly operationDeadlineMs: number;
   private readonly sessions = new Map<string, NativeSession>();
   private readonly connecting = new Map<string, Promise<Session>>();
   private closed = false;
@@ -284,6 +307,7 @@ export class AppleHub {
   constructor(options: AppleHubOptions = {}) {
     this.boundary = options.boundary ?? new NativeAppleBoundary();
     this.idleTimeoutMs = options.idleTimeoutMs ?? 5 * 60_000;
+    this.operationDeadlineMs = options.operationDeadlineMs ?? OPERATION_DEADLINE_MS;
     this.video = options.video ?? new SimulatorVideo({
       helper: new URL(import.meta.url.endsWith('/src/apple.ts') ? '../plugins/apple-device-hub/dist/simulator-stream' : './simulator-stream', import.meta.url),
       keepAlive: id => this.keepVideoSessionAlive(id),
@@ -425,7 +449,7 @@ export class AppleHub {
     try {
       // The initial native observation establishes logical coordinates even
       // when the user subsequently hides the accessibility tree.
-      await this.capture(session.public.id);
+      await this.serial(session.public.id, () => this.nativeCapture(session, {}, BOOT_TIMEOUT_MS), BOOT_TIMEOUT_MS + 10_000);
       if (this.closed || session.closing) throw new SessionExpiredError();
       return this.publicSession(session);
     } catch (error) {
@@ -434,15 +458,31 @@ export class AppleHub {
     }
   }
 
-  private async serial<T>(sessionId: string, operation: (session: NativeSession) => Promise<T>): Promise<T> {
+  private async serial<T>(sessionId: string, operation: (session: NativeSession) => Promise<T>, deadlineMs = this.operationDeadlineMs): Promise<T> {
     const session = this.sessions.get(sessionId);
     if (this.closed || !session || session.closing) throw new SessionExpiredError();
     clearTimeout(session.timer);
     session.pending++;
-    const result = session.queue.then(() => operation(session));
+    let started = false, abandoned = false;
+    const result = session.queue.then(() => {
+      // A caller that already gave up must not have its input delivered late.
+      if (abandoned) throw new Error('Abandoned device request.');
+      started = true;
+      return operation(session);
+    });
     session.queue = result.catch(() => {});
-    try { return await result; }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        abandoned = true;
+        reject(new Error(started
+          ? `The device did not finish within ${deadlineMs / 1000} s. It may still complete; observe the screen before retrying.`
+          : 'The device is still busy with an earlier request. Try again shortly.'));
+      }, deadlineMs);
+    });
+    try { return await Promise.race([result, deadline]); }
     finally {
+      clearTimeout(timer);
       session.pending--;
       if (!session.closing && session.pending === 0) {
         session.timer = setTimeout(() => { void this.disconnect(sessionId).catch(() => {}); }, this.idleTimeoutMs);
@@ -463,7 +503,7 @@ export class AppleHub {
       const enabled = options.accessibilityEnabled ?? session.public.accessibilityEnabled;
       const capture = enabled ? await this.nativeCapture(session) : await this.screenCapture(session);
       if (options.updateAccessibilityPreference ?? true) session.public.accessibilityEnabled = enabled;
-      return this.captureResult(session, capture, enabled, options.resolution);
+      return this.captureResult(session, capture, enabled, options);
     });
   }
 
@@ -485,8 +525,11 @@ export class AppleHub {
     }
   }
 
-  private async captureResult(session: NativeSession, observation: NativeObservation, accessibilityEnabled: boolean, resolution: Resolution = 'points'): Promise<Capture> {
+  private async captureResult(session: NativeSession, observation: NativeObservation, accessibilityEnabled: boolean, { resolution = 'points', screenshot = 'always' }: CaptureOptions = {}): Promise<Capture> {
     if (!session.coordinateSpace) throw new Error('Device logical coordinates are unavailable. Capture the accessibility hierarchy again.');
+    const elements = accessibilityEnabled ? session.snapshot?.elements : undefined;
+    // A screen with almost no elements (games, canvases, web content, boot) needs the image to be understood.
+    const includeImage = screenshot === 'always' || (screenshot === 'auto' && (elements?.length ?? 0) < 3);
     let settings: DeviceSettings | undefined;
     try {
       settings = appearanceSettings(await this.deviceJson(['--timeout', '5', 'device', 'info', 'appearance', '--device', session.public.device.id], 7_000));
@@ -496,38 +539,48 @@ export class AppleHub {
     }
     return {
       session: this.publicSession(session), capturedAt: new Date().toISOString(),
-      screenshot: await (async () => {
+      ...(includeImage ? { screenshot: await (async () => {
         const image = resolution === 'points' ? await this.pointImage(session, observation.image) : observation.image;
         return { ...imageInfo(image), data: image.toString('base64') };
-      })(),
+      })() } : {}),
       coordinateSpace: { ...session.coordinateSpace },
       ...(session.deviceOrientation ? { deviceOrientation: session.deviceOrientation } : {}),
       ...(accessibilityEnabled ? { hierarchy: observation.hierarchy } : {}),
       ...(observation.applicationState ? { applicationState: observation.applicationState } : {}),
       ...(settings ? { settings } : {}),
       ...(session.snapshot ? { snapshot: session.snapshot.id, ...(session.snapshot.bundleId ? { bundleId: session.snapshot.bundleId } : {}) } : {}),
-      ...(accessibilityEnabled && session.snapshot ? { elements: session.snapshot.elements } : {}),
+      ...(elements ? { elements } : {}),
     };
   }
 
-  private async nativeCapture(session: NativeSession, args: Record<string, unknown> = {}): Promise<NativeObservation> {
-    for (let attempt = 0; attempt < 2; attempt++) {
+  private async nativeCapture(session: NativeSession, args: Record<string, unknown> = {}, timeoutMs?: number): Promise<NativeObservation> {
+    let failure = new Error('Xcode accessibility hierarchy is temporarily unavailable; the device may still be starting. Observe again in a few seconds.');
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt) await new Promise(resolve => setTimeout(resolve, 300));
       const data = appleToolData(await this.boundary.tool('DeviceInteractionSynthesize', {
         interactSessionKey: session.key, interactionCommand: '', ...(attempt === 0 ? args : {}),
-      }));
-      if (!data.hierarchyPath) {
-        if (attempt === 0) continue;
-        throw new Error('Xcode accessibility hierarchy is temporarily unavailable. Capture again.');
-      }
+      }, timeoutMs));
+      if (!data.hierarchyPath) continue;
       const hierarchy = await readFile(data.hierarchyPath, 'utf8');
       const image = await readFile(data.screenshotPath);
-      try { session.coordinateSpace = logicalDimensions(hierarchy, pngDimensions(image)); }
-      catch (error) { if (attempt === 0) continue; throw error; }
+      const size = pngDimensions(image);
+      try { session.coordinateSpace = logicalDimensions(hierarchy, size); }
+      catch (error) {
+        // While a device starts, Xcode can report a hierarchy with no window.
+        // The previous bounds hold while the screen keeps its shape; a window
+        // of another shape is a rotation and must not reuse them.
+        const previous = session.coordinateSpace;
+        const windowless = !/^\s*(?:UIWindow|Window)\b/m.test(hierarchy);
+        if (!windowless || !previous || Math.abs(previous.width / previous.height - size.width / size.height) >= 0.02) {
+          failure = error as Error;
+          continue;
+        }
+      }
       session.deviceOrientation = hierarchy.match(/^Device orientation: (.+)$/m)?.[1];
       this.recordSnapshot(session, hierarchy);
       return { image, hierarchy, applicationState: data.applicationState };
     }
-    throw new Error('Could not capture device state.');
+    throw failure;
   }
 
   private recordSnapshot(session: NativeSession, hierarchy: string) {
@@ -612,7 +665,7 @@ export class AppleHub {
         // A rotation invalidates cached touch coordinates; take a full observation instead.
         if (!viewport || Math.abs(info.width / info.height - viewport.width / viewport.height) > 0.02) {
           const enabled = session.public.accessibilityEnabled;
-          return this.captureResult(session, await this.nativeCapture(session), enabled, 'full');
+          return this.captureResult(session, await this.nativeCapture(session), enabled, { resolution: 'full' });
         }
         return {
           session: this.publicSession(session), capturedAt: new Date().toISOString(),
@@ -724,7 +777,7 @@ export class AppleHub {
         await this.waitForIdle(session);
         observation = await synthesize('');
       }
-      return this.captureResult(session, observation, options.accessibilityEnabled ?? session.public.accessibilityEnabled, options.resolution);
+      return this.captureResult(session, observation, options.accessibilityEnabled ?? session.public.accessibilityEnabled, options);
     });
   }
 
@@ -756,7 +809,7 @@ export class AppleHub {
       if (flags.length) await this.boundary.command(['devicectl', '--quiet', 'device', 'settings', 'appearance', '--device', id, ...flags]);
       const enabled = options.accessibilityEnabled ?? session.public.accessibilityEnabled;
       const capture = enabled ? await this.nativeCapture(session) : await this.screenCapture(session);
-      return this.captureResult(session, capture, enabled, options.resolution);
+      return this.captureResult(session, capture, enabled, options);
     });
   }
 

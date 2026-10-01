@@ -27,7 +27,7 @@ test("summaries keep controls and content, and drop wrappers, duplicates and rep
   assert.equal(settings.elements.filter(element => element.label === "Dictate").length, 1);
   assert.equal(settings.elements.some(element => /scroll bar/.test(element.label ?? "")), false);
   assert.deepEqual(settings.elements.map(element => element.ref).slice(0, 3), ["e1", "e2", "e3"]);
-  assert.equal(formatElement(settings.elements.find(element => element.label === "General")!), '[e6] Button "General" id="com.apple.settings.general" @ 201,406.3');
+  assert.equal(formatElement(settings.elements.find(element => element.label === "General")!), '[e6] Button "General" id="com.apple.settings.general" @ 201,406.3 370×52');
 });
 
 test("resolution prefers exact labels and controls, and explains ambiguity", () => {

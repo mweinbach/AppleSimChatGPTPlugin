@@ -21,10 +21,10 @@ Find the bundle ID with `xcodebuild -scheme <Scheme> -showBuildSettings | grep P
 ## Walk the flow
 
 1. Turn the request into short steps, each with the result you expect to see: a screen title, a label, a value, a button becoming enabled.
-2. For each step, act, then compare the returned elements and screenshot with the expected result. Record what you actually saw.
+2. For each step, act, then compare the returned elements with the expected result. Pass `screenshot: "always"` when the result is visual, such as an image that loaded, a chart, or a layout. Record what you actually saw.
 3. Reach off-screen rows by scrolling the list until the target appears in the elements. Type into fields with `simulator_type_text` and a `target`; finish with Return.
 4. Alerts and permission prompts appear in the elements. Answer them deliberately, and ask the user about permissions that matter to the test.
-5. When a step fails, relaunch and reproduce it once before reporting, and keep the failing screen.
+5. When a step fails, relaunch and reproduce it once before reporting, and capture the failing screen with `screenshot: "always"` as evidence.
 
 ## Report
 

@@ -7,13 +7,13 @@ description: Review iOS screens for accessibility with Apple Device Hub — Voic
 
 Follow the device-hub skill for connecting. The element list is what VoiceOver reads; `accessibilityEnabled` only controls whether you receive it and does not turn VoiceOver on.
 
-1. Open the screen to review and call `device_capture`. Record the original `settings` values so you can restore them.
+1. Open the screen to review and call `device_capture` with `screenshot: "always"`; this review is visual, so use it for every capture and settings change below. Record the original `settings` values so you can restore them.
 2. Check the elements at the current settings:
    - Buttons, links and images without a label, or labelled with a symbol or file name ("Square grid 3x3", "icon_close").
    - Tappable controls exposed with the wrong role, such as a row reported as StaticText.
    - Visible text or controls missing from the list, which VoiceOver cannot reach.
    - Toggles, sliders and pickers without a value.
-   - Controls that look smaller than 44 × 44 points in the screenshot.
+   - Controls smaller than 44 × 44 points; each element lists its size after its tap point.
 3. Set `textSize` to `accessibility-extra-extra-extra-large`. Look for truncated, clipped or overlapping text and controls pushed off screen, scrolling if the screen scrolls.
 4. Set `appearance` to `dark`, then `increasedContrast` to `true`. Look for text or icons that become hard to read.
 5. Set `reduceMotion` and `reduceTransparency` to `true` and confirm the screen still works and stays legible.

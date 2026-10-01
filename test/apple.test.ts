@@ -40,7 +40,7 @@ function jpeg(width = 644, height = 1400): Buffer {
   return Buffer.concat([Buffer.from([0xff, 0xd8]), app0, sof]);
 }
 
-async function fixture(t: TestContext, idleTimeoutMs = 60_000, video?: SimulatorVideo) {
+async function fixture(t: TestContext, idleTimeoutMs = 60_000, video?: SimulatorVideo, operationDeadlineMs?: number) {
   const directory = await mkdtemp(join(tmpdir(), 'apple-hub-test-'));
   const screenshotPath = join(directory, 'native.png');
   const hierarchyPath = join(directory, 'native.txt');
@@ -83,7 +83,7 @@ async function fixture(t: TestContext, idleTimeoutMs = 60_000, video?: Simulator
     },
     async close() { closed = true; },
   };
-  const hub = new AppleHub({ boundary, idleTimeoutMs, video });
+  const hub = new AppleHub({ boundary, idleTimeoutMs, video, ...(operationDeadlineMs ? { operationDeadlineMs } : {}) });
   t.after(async () => {
     try { if (!closed) await hub.close(); }
     finally { await rm(directory, { recursive: true, force: true }); }
@@ -312,7 +312,7 @@ test('live frames are compressed screenshots without hierarchy or settings queri
   assert.equal(f.commands.filter((args) => args.includes('appearance')).length, queries);
   // Without a compressor the raw capture is sent instead of dropping the frame.
   f.setCompressed(undefined);
-  assert.equal((await f.hub.frame(session.id)).screenshot.mimeType, 'image/png');
+  assert.equal((await f.hub.frame(session.id)).screenshot!.mimeType, 'image/png');
 });
 
 test('a rotated live frame falls back to a full observation for new coordinates', async (t) => {
@@ -322,7 +322,7 @@ test('a rotated live frame falls back to a full observation for new coordinates'
   await writeFile(f.screenshotPath, png(2868, 1320)); await writeFile(f.hierarchyPath, landscape);
   const frame = await f.hub.frame(session.id);
   assert.deepEqual(frame.coordinateSpace, { width: 956, height: 440 });
-  assert.equal(frame.screenshot.mimeType, 'image/png');
+  assert.equal(frame.screenshot!.mimeType, 'image/png');
   assert.equal(frame.hierarchy, landscape);
 });
 
@@ -384,9 +384,50 @@ test('agent captures are resized to logical points when a compressor is availabl
   const session = await f.hub.connect('sim-1');
   f.setCompressed(jpeg(440, 956));
   const agent = await f.hub.capture(session.id);
-  assert.deepEqual([agent.screenshot.mimeType, agent.screenshot.width, agent.screenshot.height], ['image/jpeg', 440, 956]);
+  assert.deepEqual([agent.screenshot!.mimeType, agent.screenshot!.width, agent.screenshot!.height], ['image/jpeg', 440, 956]);
   const viewer = await f.hub.capture(session.id, { resolution: 'full' });
-  assert.deepEqual([viewer.screenshot.mimeType, viewer.screenshot.width], ['image/png', 1320]);
+  assert.deepEqual([viewer.screenshot!.mimeType, viewer.screenshot!.width], ['image/png', 1320]);
+});
+
+test('auto screenshots attach an image only when the element list cannot describe the screen', async (t) => {
+  const f = await fixture(t);
+  await writeFile(f.hierarchyPath, settingsHierarchy);
+  const session = await f.hub.connect('sim-1');
+  const described = await f.hub.capture(session.id, { screenshot: 'auto' });
+  assert.ok(described.elements!.length >= 3);
+  assert.equal(described.screenshot, undefined);
+  assert.equal((await f.hub.action(session.id, { type: 'button', button: 'home' }, { settle: false, screenshot: 'auto' })).screenshot, undefined);
+  assert.ok((await f.hub.capture(session.id, { screenshot: 'auto', accessibilityEnabled: false })).screenshot, 'a screen without elements needs its image');
+  assert.equal((await f.hub.capture(session.id, { screenshot: 'never', accessibilityEnabled: false })).screenshot, undefined);
+  await writeFile(f.hierarchyPath, portrait);
+  assert.ok((await f.hub.capture(session.id, { screenshot: 'auto' })).screenshot, 'a nearly empty element list is not a description');
+  assert.ok((await f.hub.capture(session.id)).screenshot, 'the viewer default always includes the image');
+});
+
+test('a windowless observation while the device starts keeps the previous coordinate space', async (t) => {
+  const f = await fixture(t);
+  const session = await f.hub.connect('sim-1');
+  await writeFile(f.hierarchyPath, 'Device orientation: Unknown\nApplication bundle identifier: com.apple.springboard\n');
+  const capture = await f.hub.capture(session.id);
+  assert.deepEqual(capture.coordinateSpace, { width: 440, height: 956 });
+});
+
+test('requests stuck behind an unresponsive device return before the host timeout and never run late', async (t) => {
+  const f = await fixture(t, 60_000, undefined, 150);
+  const session = await f.hub.connect('sim-1');
+  let release!: () => void;
+  const stuck = new Promise<void>(resolve => { release = resolve; });
+  f.setToolHook(async (name, args) => {
+    if (name === 'DeviceInteractionSynthesize' && args.interactionCommand === 't 100 200') await stuck;
+    return undefined;
+  });
+  const first = f.hub.action(session.id, { type: 'tap', x: 100, y: 200 }, { settle: false });
+  const queued = f.hub.action(session.id, { type: 'tap', x: 300, y: 300 }, { settle: false });
+  await assert.rejects(first, /did not finish within/);
+  await assert.rejects(queued, /still busy/);
+  release();
+  await f.hub.capture(session.id);
+  assert.equal(f.calls.some(call => call.args.interactionCommand === 't 300 300'), false, 'an abandoned request never sends its input');
 });
 
 test('double taps and holds use the native grammar and reject incompatible input before mutation', async (t) => {
@@ -538,7 +579,7 @@ test('failed input observations never replay input and invalidate the previous s
     ? { structuredContent: { screenshotPath: f.screenshotPath } } : undefined);
   const count = f.calls.length;
   await assert.rejects(f.hub.action(session.id, { type: 'tap', x: 100, y: 200 }, { settle: false }), /hierarchy is temporarily unavailable/);
-  assert.deepEqual(f.calls.slice(count).map(call => call.args.interactionCommand), ['t 100 200', '']);
+  assert.deepEqual(f.calls.slice(count).map(call => call.args.interactionCommand), ['t 100 200', '', '']);
   f.setToolHook(undefined);
   const failedCount = f.calls.length;
   await assert.rejects(f.hub.action(session.id, { type: 'tap', element: { ref: general.ref } }, { snapshot: capture.snapshot }), /snapshot is stale/);

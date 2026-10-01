@@ -1,10 +1,9 @@
 import { useState } from "react";
-import { ChevronDown, ChevronRight, LoaderCircle, RefreshCw, Smartphone, Tablet, TriangleAlert, Watch } from "lucide-react";
+import { ChevronDown, ChevronRight, LoaderCircle, Smartphone, Tablet, TriangleAlert, Watch } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "./ui/alert.js";
 import { Button } from "./ui/button.js";
-import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip.js";
 import type { Device } from "../shared.js";
-import { connectDevice, scanDevices, toggleConnection, type ViewerState } from "../viewer-controller.js";
+import { connectDevice, type ViewerState } from "../viewer-controller.js";
 
 export function deviceForm(device?: Pick<Device, "name">): "phone" | "tablet" | "watch" {
   if (!device) return "phone";
@@ -13,7 +12,7 @@ export function deviceForm(device?: Pick<Device, "name">): "phone" | "tablet" | 
   return "phone";
 }
 
-function DeviceIcon({ device }: { device?: Pick<Device, "name"> }) {
+export function DeviceIcon({ device }: { device?: Pick<Device, "name"> }) {
   const form = deviceForm(device);
   return form === "tablet" ? <Tablet /> : form === "watch" ? <Watch /> : <Smartphone />;
 }
@@ -28,27 +27,6 @@ function compareSimulators(left: Device, right: Device) {
   const [a, b] = [version(left), version(right)];
   for (let index = 0; index < Math.max(a.length, b.length); index++) if ((a[index] ?? 0) !== (b[index] ?? 0)) return (b[index] ?? 0) - (a[index] ?? 0);
   return left.name.localeCompare(right.name);
-}
-
-/** The connected device's identity, or the list's title before connecting. */
-export function DeviceBar({ state }: { state: ViewerState }) {
-  const device = state.session?.device;
-  const disabled = !state.initialized || state.busy || state.ended;
-  if (!device) {
-    return <header className="device-bar">
-      <h1 className="device-bar-title">Choose a device</h1>
-      <Tooltip><TooltipTrigger asChild><Button id="scan" variant="ghost" size="icon-sm" className="device-bar-end" disabled={disabled} onClick={() => void scanDevices()} aria-label="Refresh device list"><RefreshCw /></Button></TooltipTrigger><TooltipContent>Refresh device list</TooltipContent></Tooltip>
-    </header>;
-  }
-  const live = state.videoReady || (state.capture && !state.busy);
-  return <header className="device-bar">
-    <span className="device-bar-icon" aria-hidden="true"><DeviceIcon device={device} /></span>
-    <div className="device-identity">
-      <h1 className="device-name" title={device.name}>{device.name}</h1>
-      <p className="device-meta"><span className="status-dot" data-state={live ? "live" : "waiting"} aria-hidden="true" />{device.runtime || device.platform}<span aria-hidden="true">·</span>{device.kind === "simulator" ? "Simulator" : "Device"}</p>
-    </div>
-    <Button id="connection" variant="ghost" size="sm" className="device-bar-end" disabled={disabled} onClick={() => void toggleConnection()}>Disconnect</Button>
-  </header>;
 }
 
 function DeviceRow({ device, state }: { device: Device; state: ViewerState }) {

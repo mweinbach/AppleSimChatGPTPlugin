@@ -22,7 +22,7 @@ function fakeHub(): { hub: Hub; calls: unknown[] } {
     async streamStop(id, streamId) { calls.push(["streamStop", id, streamId]); },
     async input(id, events) { calls.push(["input", id, events]); },
     async action(id, action, options) { calls.push(["action", id, action, options]); return frame(); },
-    async settings(id, settings) { calls.push(["settings", id, settings]); return frame(); },
+    async settings(id, settings, options) { calls.push(["settings", id, settings, ...(options ? [options] : [])]); return frame(); },
     async disconnect(id) { calls.push(["disconnect", id]); },
     async close() {},
   };
@@ -76,13 +76,24 @@ test("model text lists elements while the raw hierarchy travels only in _meta fo
   assert.match((captureResult(frame(false)).content[0] as { text: string }).text, /elements are hidden/);
 });
 
+test("a text-only result says the screenshot was left out and how to request it", () => {
+  const { screenshot: _screenshot, ...textOnly } = frame();
+  const capture: Capture = { ...textOnly, elements: [{ ref: "e1", role: "Button", label: "General", frame: { x: 16, y: 380, width: 370, height: 52 }, point: { x: 201, y: 406 } }] };
+  const result = captureResult(capture);
+  assert.deepEqual(result.content.map(item => item.type), ["text"]);
+  assert.equal(result.structuredContent?.screenshot, undefined);
+  assert.match((result.content[0] as { text: string }).text, /No screenshot attached; the elements below describe the screen\. Pass screenshot: "always"/);
+});
+
 test("actions pass settle and resolution through and default to agent behaviour", async () => {
   const { hub, calls } = fakeHub();
   await callHubTool(hub, "device_action", { sessionId: session.id, action: { type: "tap", element: { ref: "e3" } } });
   await callHubTool(hub, "device_action", { sessionId: session.id, action: { type: "scroll", direction: "down" }, settle: false, resolution: "full" });
+  await callHubTool(hub, "device_settings", { sessionId: session.id, settings: { appearance: "dark" }, screenshot: "always" });
   assert.deepEqual(calls, [
-    ["action", session.id, { type: "tap", element: { ref: "e3" } }, {}],
-    ["action", session.id, { type: "scroll", direction: "down", distance: 0.6 }, { settle: false, resolution: "full" }],
+    ["action", session.id, { type: "tap", element: { ref: "e3" } }, { screenshot: "auto" }],
+    ["action", session.id, { type: "scroll", direction: "down", distance: 0.6 }, { screenshot: "auto", settle: false, resolution: "full" }],
+    ["settings", session.id, { appearance: "dark" }, { screenshot: "always" }],
   ]);
   assert.equal((await callHubTool(hub, "device_action", { sessionId: session.id, action: { type: "tap", element: { ref: "button-3" } } })).isError, true);
   assert.equal((await callHubTool(hub, "device_action", { sessionId: session.id, action: { type: "launchApp", bundleId: "com.apple.x; rm -rf" } })).isError, true);
@@ -91,7 +102,7 @@ test("actions pass settle and resolution through and default to agent behaviour"
 test("disabling the hierarchy passes the view preference through and omits tree data from the result", async () => {
   const { hub, calls } = fakeHub();
   const result = await callHubTool(hub, "device_capture", { sessionId: session.id, accessibilityEnabled: false });
-  assert.deepEqual(calls, [["capture", session.id, { accessibilityEnabled: false }]]);
+  assert.deepEqual(calls, [["capture", session.id, { accessibilityEnabled: false, screenshot: "auto" }]]);
   assert.equal(result.structuredContent?.hierarchy, undefined);
   assert.equal(JSON.stringify(result.content).includes("Window"), false);
 });
@@ -143,9 +154,9 @@ test("simulator computer tools preserve viewer preferences and route scoped acti
   const clicked = await callHubTool(hub, "simulator_click", { sessionId: session.id, target: 3, snapshot: 7 });
   assert.equal(clicked.isError, undefined);
   assert.deepEqual(calls, [
-    ["capture", session.id, { simulatorOnly: true, accessibilityEnabled: true, updateAccessibilityPreference: false }],
-    ["capture", session.id, { simulatorOnly: true, accessibilityEnabled: false, updateAccessibilityPreference: false }],
-    ["action", session.id, { type: "tap", element: { ref: "e3" }, clickCount: 1 }, { simulatorOnly: true, accessibilityEnabled: true, snapshot: 7 }],
+    ["capture", session.id, { simulatorOnly: true, accessibilityEnabled: true, updateAccessibilityPreference: false, screenshot: "auto" }],
+    ["capture", session.id, { simulatorOnly: true, accessibilityEnabled: false, updateAccessibilityPreference: false, screenshot: "always" }],
+    ["action", session.id, { type: "tap", element: { ref: "e3" }, clickCount: 1 }, { simulatorOnly: true, accessibilityEnabled: true, screenshot: "auto", snapshot: 7 }],
   ]);
   calls.length = 0;
   assert.equal((await callHubTool(hub, "simulator_click", { sessionId: session.id, target: 3 })).isError, true);

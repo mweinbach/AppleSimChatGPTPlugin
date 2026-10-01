@@ -9,7 +9,7 @@ import type { AppleHub } from "./apple.js";
 import { SessionExpiredError } from "./apple.js";
 import { formatElement } from "./elements.js";
 import { actionSchema, HIERARCHY_META_KEY, liveInputSchema, settingsSchema, type Capture, type CaptureState } from "./shared.js";
-import { computerAction, computerInputs, type ComputerToolName } from "./computer.js";
+import { computerAction, computerInputs, screenshotOption, type ComputerToolName } from "./computer.js";
 export { HIERARCHY_META_KEY };
 
 export const UI_URI = "ui://apple-device-hub/viewer";
@@ -22,14 +22,14 @@ export const toolInputs = {
   device_hub_preferences: z.object({}),
   device_hub_status: z.object({}),
   device_connect: z.object({ deviceId: z.string().min(1).max(200) }),
-  device_capture: z.object({ sessionId, accessibilityEnabled: z.boolean().optional(), resolution }),
+  device_capture: z.object({ sessionId, accessibilityEnabled: z.boolean().optional(), resolution, screenshot: screenshotOption }),
   device_frame: z.object({ sessionId }),
   device_stream: z.object({ sessionId, codec: z.enum(["hevc", "h264"]).default("h264"), maxDimension: z.number().int().min(320).max(8192).optional().describe("Longest encoded edge in pixels; the simulator's resolution when larger or unset.") }),
   device_stream_read: z.object({ sessionId, streamId: z.string().regex(/^[a-f0-9]{48}$/) }),
   device_stream_stop: z.object({ sessionId, streamId: z.string().regex(/^[a-f0-9]{48}$/) }),
   device_input: z.object({ sessionId, events: z.array(liveInputSchema).min(1).max(64) }),
-  device_action: z.object({ sessionId, action: actionSchema, settle: z.boolean().optional().describe("Wait for animations to finish before observing (default true)."), resolution }),
-  device_settings: z.object({ sessionId, resolution, settings: settingsSchema.refine(value => Object.values(value).some(item => item !== undefined), "Choose at least one setting.") }),
+  device_action: z.object({ sessionId, action: actionSchema, settle: z.boolean().optional().describe("Wait for animations to finish before observing (default true)."), resolution, screenshot: screenshotOption }),
+  device_settings: z.object({ sessionId, resolution, screenshot: screenshotOption, settings: settingsSchema.refine(value => Object.values(value).some(item => item !== undefined), "Choose at least one setting.") }),
   device_disconnect: z.object({ sessionId }),
 };
 export type ToolName = keyof typeof toolInputs;
@@ -44,11 +44,18 @@ export function describeCapture(capture: Capture): string {
   if (capture.settings && Object.keys(capture.settings).length) {
     lines.push(`Settings: ${Object.entries(capture.settings).map(([name, value]) => `${name} ${value}`).join(", ")}. Restore changed settings when finished.`);
   }
-  const pointsImage = screenshot.width === Math.round(coordinateSpace.width) && screenshot.height === Math.round(coordinateSpace.height);
-  lines.push(pointsImage ? "Screenshot pixels are logical points: a pixel position in the image is a tap coordinate." : `Screenshot is ${screenshot.width}×${screenshot.height} px; scale positions to the ${coordinateSpace.width}×${coordinateSpace.height} pt coordinate space before tapping.`);
+  if (!screenshot) {
+    lines.push(capture.elements?.length
+      ? "No screenshot attached; the elements below describe the screen. Pass screenshot: \"always\" to check visual details such as layout, color or images."
+      : "No screenshot attached.");
+  } else if (screenshot.width === Math.round(coordinateSpace.width) && screenshot.height === Math.round(coordinateSpace.height)) {
+    lines.push("Screenshot pixels are logical points: a pixel position in the image is a tap coordinate.");
+  } else {
+    lines.push(`Screenshot is ${screenshot.width}×${screenshot.height} px; scale positions to the ${coordinateSpace.width}×${coordinateSpace.height} pt coordinate space before tapping.`);
+  }
   if (capture.elements) {
     lines.push("", capture.elements.length
-      ? `Elements (${capture.elements.length}). Act on one with device_action, e.g. {"type":"tap","element":{"ref":"e1"}}; "@ x,y" is its tap point:`
+      ? `Elements (${capture.elements.length}). Act on one with device_action, e.g. {"type":"tap","element":{"ref":"e1"}}; "@ x,y" is its tap point, followed by its size in points:`
       : "No accessibility elements reported for this screen; use screenshot coordinates.");
     lines.push(...capture.elements.map(formatElement));
   } else {
@@ -59,9 +66,9 @@ export function describeCapture(capture: Capture): string {
 
 export function captureResult(capture: Capture): CallToolResult {
   const { screenshot, elements: _elements, hierarchy, ...rest } = capture;
-  const state: CaptureState = { ...rest, screenshot: { mimeType: screenshot.mimeType, width: screenshot.width, height: screenshot.height } };
+  const state: CaptureState = { ...rest, ...(screenshot ? { screenshot: { mimeType: screenshot.mimeType, width: screenshot.width, height: screenshot.height } } : {}) };
   return {
-    content: [{ type: "text", text: describeCapture(capture) }, { type: "image", data: screenshot.data, mimeType: screenshot.mimeType }],
+    content: [{ type: "text", text: describeCapture(capture) }, ...(screenshot ? [{ type: "image" as const, data: screenshot.data, mimeType: screenshot.mimeType }] : [])],
     structuredContent: state as unknown as Record<string, unknown>,
     // The viewer shows the raw tree; keeping it in _meta keeps it out of model context.
     ...(hierarchy !== undefined ? { _meta: { [HIERARCHY_META_KEY]: hierarchy } } : {}),
@@ -82,7 +89,7 @@ export async function callHubTool(hub: Hub, name: string, args: unknown): Promis
       }
       case "device_capture": {
         const input = toolInputs.device_capture.parse(args);
-        return captureResult(await hub.capture(input.sessionId, { accessibilityEnabled: input.accessibilityEnabled, ...(input.resolution ? { resolution: input.resolution } : {}) }));
+        return captureResult(await hub.capture(input.sessionId, { accessibilityEnabled: input.accessibilityEnabled, screenshot: input.screenshot, ...(input.resolution ? { resolution: input.resolution } : {}) }));
       }
       case "device_frame": {
         const input = toolInputs.device_frame.parse(args);
@@ -110,20 +117,24 @@ export async function callHubTool(hub: Hub, name: string, args: unknown): Promis
       }
       case "device_action": {
         const input = toolInputs.device_action.parse(args);
-        return captureResult(await hub.action(input.sessionId, input.action, { ...(input.settle !== undefined ? { settle: input.settle } : {}), ...(input.resolution ? { resolution: input.resolution } : {}) }));
+        return captureResult(await hub.action(input.sessionId, input.action, { screenshot: input.screenshot, ...(input.settle !== undefined ? { settle: input.settle } : {}), ...(input.resolution ? { resolution: input.resolution } : {}) }));
       }
       case "device_settings": {
         const input = toolInputs.device_settings.parse(args);
-        return captureResult(await hub.settings(input.sessionId, input.settings, input.resolution ? { resolution: input.resolution } : {}));
+        return captureResult(await hub.settings(input.sessionId, input.settings, { screenshot: input.screenshot, ...(input.resolution ? { resolution: input.resolution } : {}) }));
       }
       case "device_disconnect": {
         const input = toolInputs.device_disconnect.parse(args);
         await hub.disconnect(input.sessionId);
         return dataResult({ sessionId: input.sessionId, disconnected: true });
       }
-      case "simulator_get_state": case "simulator_screenshot": {
-        const input = computerInputs[name].parse(args);
-        return captureResult(await hub.capture(input.sessionId, { simulatorOnly: true, accessibilityEnabled: name === "simulator_get_state", updateAccessibilityPreference: false }));
+      case "simulator_get_state": {
+        const input = computerInputs.simulator_get_state.parse(args);
+        return captureResult(await hub.capture(input.sessionId, { simulatorOnly: true, accessibilityEnabled: true, updateAccessibilityPreference: false, screenshot: input.screenshot }));
+      }
+      case "simulator_screenshot": {
+        const input = computerInputs.simulator_screenshot.parse(args);
+        return captureResult(await hub.capture(input.sessionId, { simulatorOnly: true, accessibilityEnabled: false, updateAccessibilityPreference: false, screenshot: "always" }));
       }
       case "simulator_click": case "simulator_drag": case "simulator_scroll": case "simulator_type_text": case "simulator_press_key": {
         const input = computerAction(name as ComputerToolName, args);
@@ -146,26 +157,26 @@ export async function appHtml(assetRoot: URL, preview = false): Promise<string> 
 }
 
 export function createHubServer(hub: Hub, assetRoot: URL): McpServer {
-  const server = new McpServer({ name: "apple-device-hub", version }, { instructions: "Use open_device_hub to show the device viewer. Choose a device from device_hub_status and connect it, then capture its screen before interacting. Coordinates are logical device points in coordinateSpace, not screenshot pixels. When accessibility is enabled, use the latest hierarchy for positions. device_capture's accessibilityEnabled flag controls whether the hierarchy is exposed; it does not change iOS accessibility settings. Device operations pass through Apple's Xcode bridge. Disconnect sessions when finished." });
+  const server = new McpServer({ name: "apple-device-hub", version }, { instructions: "Use open_device_hub to show the device viewer. Choose a device from device_hub_status and connect it, then observe before acting. Work in small verified steps: observe, act on one element by ref, then read the returned screen to confirm the result before the next step. Results are text-first: the element list describes the screen, and with the default screenshot: \"auto\" an image is attached only when the elements cannot describe it. Pass screenshot: \"always\" to judge layout, color or images. Coordinates are logical device points in coordinateSpace. accessibilityEnabled controls whether elements are exposed; it does not change iOS accessibility settings. Device operations pass through Apple's Xcode bridge. Restore changed settings and disconnect sessions when finished." });
   registerAppResource(server, "Apple Device Hub", UI_URI, {}, async () => ({ contents: [{ uri: UI_URI, mimeType: RESOURCE_MIME_TYPE, text: await appHtml(assetRoot), _meta: { ui: { prefersBorder: false } } }] }));
   const definitions: { name: ToolName; title: string; description: string; readOnly: boolean; destructive?: boolean; openWorld?: boolean; appOnly?: boolean; opening?: OpenAIUiToolMetadata }[] = [
     { name: "open_device_hub", title: "Apple Device Hub", description: "Open the local Apple Device Hub. View and control simulators or connected Apple devices beside the conversation.", readOnly: true, opening: { entrypoints: [{ type: "global" }, { type: "thread" }], preferredModelDisplayMode: "fullscreen" } },
     { name: "device_hub_preferences", title: "Device Hub settings", description: "Open Apple Device Hub device and accessibility controls.", readOnly: true, opening: { entrypoints: [{ type: "settings", searchTerms: ["device", "simulator", "accessibility"] }] } },
     { name: "device_hub_status", title: "List Apple devices", description: "List local simulators, paired physical device candidates, and active interaction sessions. Physical-device availability reflects discovery and pairing; successful device_connect confirms Apple's interaction eligibility.", readOnly: true },
     { name: "device_connect", title: "Connect device", description: "Start an Apple device interaction session for a device ID from the inventory. Boots a simulator when needed. Returns a local session ID; Apple's secret session key stays on the server.", readOnly: false },
-    { name: "device_capture", title: "Capture device screen", description: "Observe the device: returns a screenshot sized in logical points plus a numbered list of on-screen accessibility elements (role, label, identifier, value, tap point). Call this before acting, then act on elements by ref with device_action. accessibilityEnabled shows or hides elements in the output; it does not change VoiceOver.", readOnly: true },
+    { name: "device_capture", title: "Capture device screen", description: "Observe the device: returns the on-screen accessibility elements (role, label, identifier, value, tap point) as text, plus a screenshot sized in logical points when the elements cannot describe the screen or screenshot is \"always\". Call this before acting, then act on elements by ref with device_action. accessibilityEnabled shows or hides elements in the output; it does not change VoiceOver.", readOnly: true },
     { name: "device_frame", title: "Stream device frame", description: "Return a compressed screen-only frame for the live viewer. No accessibility hierarchy or settings.", readOnly: true, appOnly: true },
     { name: "device_stream", title: "Stream simulator video", description: "Start a stateful live hardware HEVC or H.264 simulator video connection for the viewer. Accessibility and device actions continue through MCP tools.", readOnly: false, appOnly: true },
     { name: "device_stream_read", title: "Read simulator video", description: "Read a bounded batch of native video access units through the host transport for the embedded viewer.", readOnly: true, appOnly: true },
     { name: "device_stream_stop", title: "Stop simulator video", description: "Release an embedded viewer's native video relay and revoke its stream capability.", readOnly: false, destructive: true, appOnly: true },
     { name: "device_input", title: "Live simulator input", description: "Deliver the viewer's live touches and Home presses to a simulator with running video. Coordinates are fractions of the displayed video frame; timing between events is preserved.", readOnly: false, destructive: true, openWorld: true, appOnly: true },
-    { name: "device_action", title: "Control device", description: "Act on the device, then return the resulting screen and element list after animations settle. Prefer element targets over coordinates: {\"type\":\"tap\",\"element\":{\"ref\":\"e12\"}} or {\"element\":{\"label\":\"General\",\"role\":\"Button\"}}. Refs come from the latest capture or action result. Other actions: type (optionally into an element, which is tapped first), scroll (direction is where the content goes: \"down\" reveals content below; optionally within an element), swipe with coordinates, button (home, lock, volumeUp, volumeDown), orientation, launchApp by bundle ID, openSettings. Coordinates are logical points and match pixels in the default screenshot.", readOnly: false, destructive: true, openWorld: true },
+    { name: "device_action", title: "Control device", description: "Act on the device, then return the resulting element list (and a screenshot per the screenshot option) after animations settle. Prefer element targets over coordinates: {\"type\":\"tap\",\"element\":{\"ref\":\"e12\"}} or {\"element\":{\"label\":\"General\",\"role\":\"Button\"}}. Refs come from the latest capture or action result. Other actions: type (optionally into an element, which is tapped first), scroll (direction is where the content goes: \"down\" reveals content below; optionally within an element), swipe with coordinates, button (home, lock, volumeUp, volumeDown), orientation, launchApp by bundle ID, openSettings. Coordinates are logical points and match pixels in the default screenshot.", readOnly: false, destructive: true, openWorld: true },
     { name: "device_settings", title: "Change device settings", description: "Change device appearance, Dynamic Type size, motion, transparency, or contrast through Apple's supported local tools. Settings persist on the selected device. Returns the resulting screen and observed setting values when available.", readOnly: false, destructive: true },
     { name: "device_disconnect", title: "Disconnect device", description: "End the Apple interaction session and release its resources.", readOnly: false, destructive: true },
-    { name: "simulator_get_state", title: "Observe simulator", description: "Simulator computer use: get the selected simulator's screenshot, accessibility elements, logical point coordinates and snapshot. Use element numbers or refs with this snapshot for input. Observations do not change the viewer's accessibility preference. Requires a device_connect session for a simulator.", readOnly: true },
-    { name: "simulator_screenshot", title: "Simulator screenshot", description: "Simulator computer use: capture only the selected simulator's screen, sized in logical points. Returns coordinateSpace for mapping image positions. Does not change the viewer's accessibility preference.", readOnly: true },
+    { name: "simulator_get_state", title: "Observe simulator", description: "Simulator computer use: get the selected simulator's accessibility elements, logical point coordinates and snapshot, with a screenshot when the elements cannot describe the screen or screenshot is \"always\". Use element numbers or refs with this snapshot for input. Observations do not change the viewer's accessibility preference. Requires a device_connect session for a simulator.", readOnly: true },
+    { name: "simulator_screenshot", title: "Simulator screenshot", description: "Simulator computer use: always capture an image of the selected simulator's screen, sized in logical points, without the element list. Returns coordinateSpace for mapping image positions. Does not change the viewer's accessibility preference.", readOnly: true },
     { name: "simulator_click", title: "Click simulator", description: "Click, double click or long press inside the selected simulator. Target an element number/ref with the snapshot from simulator_get_state, an accessibility selector, or [x,y] in logical points. Returns the resulting screen and accessibility elements. Input never targets the Mac desktop.", readOnly: false, destructive: true, openWorld: true },
-    { name: "simulator_drag", title: "Drag in simulator", description: "Drag from one logical [x,y] point to another inside the selected simulator. Returns the resulting screenshot and accessibility state. Use current simulator_get_state coordinates.", readOnly: false, destructive: true, openWorld: true },
+    { name: "simulator_drag", title: "Drag in simulator", description: "Drag from one logical [x,y] point to another inside the selected simulator. Returns the resulting screen and accessibility state. Use current simulator_get_state coordinates.", readOnly: false, destructive: true, openWorld: true },
     { name: "simulator_scroll", title: "Scroll simulator", description: "Scroll the selected simulator, optionally at a logical [x,y] point or within an accessibility element. Down reveals content below; right reveals content to the right. Distance is a fraction of the visible region. Returns the resulting screen.", readOnly: false },
     { name: "simulator_type_text", title: "Type in simulator", description: "Type literal Unicode text inside the selected simulator, optionally focusing a target first. Target accepts [x,y], a selector or an element number/ref with its snapshot. Focus and typing execute together. Returns the resulting screen and accessibility state.", readOnly: false, destructive: true, openWorld: true },
     { name: "simulator_press_key", title: "Press simulator key", description: "Press a supported keyboard or hardware key on the selected simulator: Return, Tab, Backspace, Home, Lock, VolumeUp or VolumeDown. Returns the resulting screen. Modifier shortcuts and desktop keyboard events are not exposed.", readOnly: false, destructive: true, openWorld: true },

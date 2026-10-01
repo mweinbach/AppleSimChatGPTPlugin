@@ -46,6 +46,6 @@ export function ElementInspector({ state, elements, selected, query, inspecting,
         <dt>Tap point</dt><dd>{selected.point.x}, {selected.point.y}</dd>
       </dl>
     </div>}
-    {enabled && <p className="pane-footer">The agent sees these refs with each screenshot. <Button id="accessibility" variant="link" size="xs" className="pane-footer-action" disabled={disabled} onClick={() => void setAccessibility(false)}>Send screenshots only</Button></p>}
+    {enabled && <p className="pane-footer">The agent reads this list instead of a screenshot when it can. <Button id="accessibility" variant="link" size="xs" className="pane-footer-action" disabled={disabled} onClick={() => void setAccessibility(false)}>Send screenshots only</Button></p>}
   </div>;
 }

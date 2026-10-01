@@ -350,3 +350,40 @@ read pending, leaving capacity for live input and accessibility observations.
 The source suite passed **127 tests**. Typecheck, build, pack, and
 `verify:packages` passed with **20 tools**. Rendering in the ChatGPT host still
 needs a plugin reinstall and a new chat, and was not performed here.
+
+## Text-first observations, bounded calls, and short host windows — September 30, 2026
+
+Measured through the built MCP server on a separate **iPhone 17, iOS 27.2**
+simulator, `0E862866-8D31-478E-9DB6-3B8217406EB2`, so the user's own simulator
+was not touched.
+
+| Call | Time | Result |
+| --- | --- | --- |
+| `simulator_get_state` (`screenshot: "auto"`, 21 elements) | 324 ms | 1.7 KB of text, no image |
+| `simulator_get_state` (`screenshot: "always"`) | 333 ms | text and a 58 KB JPEG |
+| `simulator_click` on Settings, settled | 3.3 s | text only |
+| `simulator_scroll`, settled | 2.9–3.0 s | text only |
+| `simulator_press_key` Home, settled | 6.9 s | text only; Xcode's Home is slow |
+
+Xcode's `DeviceInteractionStartSession` returned in 48 ms for a shut-down
+simulator; its first observation then took 9.2 s while the device booted. One
+run reported a hierarchy without window bounds just after boot, and the next two
+observations failed the same way. Observations now retry three times and keep
+the previous coordinate space when the hierarchy has no window and the image
+keeps its shape; a window of another shape still rejects. Xcode requests time out
+after 40 s (100 s for the booting observation), and a request returns within
+55 s, even when queued behind a stuck one, without sending its input later.
+
+Codex loads this plugin through its root Agent Plugins `plugin.json`, whose
+`mcp.json` schema rejects unknown keys: adding `startup_timeout_sec` there made
+`codex mcp get` stop listing the server, and the `.codex-plugin` overlay only
+merges environment variables. Codex's own defaults, a 30 s startup and 300 s tool
+timeout (`codex-rs/codex-mcp/src/rmcp_client.rs`), already cover the first `npx`
+download and every bounded call, so the plugin sets no timeouts.
+
+The viewer was checked in headless Chrome at the user's ChatGPT window size,
+**840 × 490**, with a 56 px bottom safe-area inset and a 350 × 44 composer drawn
+at the bottom right, plus 700 × 560, 420 × 880 and 1360 × 860, in light and dark.
+At 840 × 490 the device rendered about 410 px tall, the controls sat in the top
+bar, the Elements and Appearance column ended above the inset, and nothing
+interactive sat under the composer. The suite passed **132 tests**.

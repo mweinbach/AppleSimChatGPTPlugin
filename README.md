@@ -40,17 +40,19 @@ If a chat shows **Failed to load** and the desktop logs report `unknown MCP serv
 
 The viewer is built for the side panel, where you watch the agent work and step in when needed. Choose a device from the list; running simulators come first and connect in one click, and a stopped simulator boots. The device then fills the panel. Click or drag the screen to touch it: with simulator video running, touches stream to the simulator as you move and Home responds immediately; otherwise a click or drag is sent as one tap or swipe through Xcode.
 
-Every action taken through the tools, by the agent or by you, appears on the live screen as it happens: a mark where it tapped or swiped, and a caption such as `e12 Tap “Settings”`. **Show what the agent sees** overlays the numbered element refs the model acts on, so you can check its narration against the screen; hover an element to name it. The dock below the screen holds Home, Lock, Rotate, typing, that overlay, the **Elements** and **Appearance** panels, and **Attach screen to your next message**. Elements lists the same refs with labels, roles and values, filters them, picks one from the screen, and taps it. Appearance changes light or dark mode, text size, motion, transparency and contrast; it shows observed values, and an unreported setting stays unknown. In a wide panel these sit in a column beside the device. Disconnect when finished; idle sessions expire after five minutes. Attaching a screen adds it and any element list to your next message when the host supports image context.
+Every action taken through the tools, by the agent or by you, appears on the live screen as it happens: a mark where it tapped or swiped, and a caption such as `e12 Tap “Settings”`. **Show what the agent sees** overlays the numbered element refs the model acts on, so you can check its narration against the screen; hover an element to name it. The controls hold Home, Lock, Rotate, typing, that overlay, the **Elements** and **Appearance** panels, and **Attach screen to your next message**. They sit in a dock below the screen in the side panel, and in the top bar of a wider window, where Elements and Appearance open as a column beside the device. Elements lists the same refs with labels, roles and values, filters them, picks one from the screen, and taps it. Appearance changes light or dark mode, text size, motion, transparency and contrast; it shows observed values, and an unreported setting stays unknown. The viewer keeps its controls clear of the host's floating composer using the safe-area insets the host reports. Disconnect when finished; idle sessions expire after five minutes. Attaching a screen adds it and any element list to your next message when the host supports image context.
 
 ### Agent device use
 
-The model drives devices with an observe → act loop:
+The model drives devices with an observe → act → verify loop, text first:
 
-1. `device_capture` returns a screenshot sized in logical points, so a pixel in the image is a tap coordinate. It also returns a numbered list of on-screen accessibility elements: role, label, identifier, value, state and tap point. The list is distilled from Xcode's hierarchy, without wrapper views, off-screen nodes, scroll bars, duplicates, or text that repeats its control's label. The raw hierarchy goes only to the viewer, in the result's `_meta`.
+1. `device_capture` returns a numbered list of on-screen accessibility elements: role, label, identifier, value, state, tap point and size. The list is distilled from Xcode's hierarchy, without wrapper views, off-screen nodes, scroll bars, duplicates, or text that repeats its control's label. The raw hierarchy goes only to the viewer, in the result's `_meta`. With the default `screenshot: "auto"`, a screenshot is attached only when the list cannot describe the screen (fewer than three elements, or elements hidden); `"always"` attaches one for visual checks and `"never"` returns text only. Screenshots are sized in logical points, so a pixel in the image is a tap coordinate. A typical text-only observation is about 2 KB instead of a 60 KB image.
 2. `device_action` acts on an element by ref (`{"type":"tap","element":{"ref":"e6"}}`) or by label, identifier and role (`{"element":{"label":"General","role":"Button"}}`). An ambiguous match is rejected with the candidates listed. Actions: `tap`, `type` (optionally into an element, which is tapped first), `scroll` (the direction is where the content goes; optionally within an element), `swipe`, `button`, `orientation`, `launchApp` by bundle ID, and `openSettings`.
 3. Each action waits until two consecutive screenshots match, up to 2.5 s, then observes again. The result shows the screen after animations, with a fresh element list. Pass `settle: false` to skip this wait.
 
 Refs resolve against the session's latest observation. The `Snapshot` number changes only when the element list changes, so refs from an identical re-capture stay valid.
+
+Calls are bounded so a prompt never hangs on the device. Xcode requests time out after 40 s with an actionable message, and any request returns within 55 s, even one queued behind a stuck request, without ever sending its input late. Connecting gets 100 s because its first observation boots a stopped simulator; Codex allows MCP tools 300 s and a 30 s server start, which covers the first `npx` download.
 
 ### Simulator computer use
 
@@ -58,15 +60,15 @@ The `simulator_*` tools offer familiar computer-use operations bound to a connec
 
 | Tool | Behavior |
 | --- | --- |
-| `simulator_get_state` | Screenshot, accessibility elements, logical coordinates and snapshot. |
-| `simulator_screenshot` | Screen-only observation at logical-point size. |
+| `simulator_get_state` | Accessibility elements, logical coordinates and snapshot, with a screenshot per `screenshot`. |
+| `simulator_screenshot` | Screen-only image at logical-point size. |
 | `simulator_click` | Click, double click (`clickCount: 2`) or long press (`duration` in seconds). |
 | `simulator_drag` | Drag between logical `from: [x,y]` and `to: [x,y]` points. |
 | `simulator_scroll` | Scroll in a direction, optionally at a point or within an element. |
 | `simulator_type_text` | Type literal Unicode text, optionally focusing a target in the same operation. |
 | `simulator_press_key` | Return, Tab, Backspace, Home, Lock, VolumeUp or VolumeDown. |
 
-Targets accept `[x,y]`, a numbered element such as `12`, a ref such as `"e12"`, or a selector such as `{"label":"General","role":"Button"}`. Element numbers and refs require the `snapshot` returned by `simulator_get_state`. The server checks that snapshot inside the device's serial input queue and rejects outdated refs before input. Every input returns the resulting screenshot and current accessibility state. Screenshot/state observations preserve the viewer's accessibility preference. Supported keyboard keys use Apple's device event bridge; desktop shortcuts, arbitrary commands and mouse hover are not exposed by this touch-device interface.
+Targets accept `[x,y]`, a numbered element such as `12`, a ref such as `"e12"`, or a selector such as `{"label":"General","role":"Button"}`. Element numbers and refs require the `snapshot` returned by `simulator_get_state`. The server checks that snapshot inside the device's serial input queue and rejects outdated refs before input. Every input returns the resulting accessibility state, with a screenshot per `screenshot`. Screenshot/state observations preserve the viewer's accessibility preference. Supported keyboard keys use Apple's device event bridge; desktop shortcuts, arbitrary commands and mouse hover are not exposed by this touch-device interface.
 
 ```json
 {"sessionId":"<public-session-id>","target":"e12","snapshot":4}
