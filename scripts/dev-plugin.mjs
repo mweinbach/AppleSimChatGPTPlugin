@@ -21,6 +21,7 @@ await writeFile(`${marketplace}.agents/plugins/marketplace.json`, JSON.stringify
   plugins: [{ name: "apple-device-hub", source: { source: "local", path: "./plugins/apple-device-hub" }, policy: { installation: "AVAILABLE", authentication: "ON_INSTALL" }, category: "Developer Tools" }],
 }, null, 2) + "\n");
 await writeFile(`${plugin}.mcp.json`, JSON.stringify({ mcpServers: { "apple-device-hub": { command: "node", args: ["./dist/server.js"], cwd: "." } } }, null, 2) + "\n");
+await writeFile(`${plugin}mcp.json`, JSON.stringify({ $schema: "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json", mcpServers: { "apple-device-hub": { type: "stdio", command: "node", args: ["./dist/server.js"], cwd: "./" } } }, null, 2) + "\n");
 // The host caches installed plugins by version, so each build needs a distinct one.
 const manifestPath = `${plugin}.codex-plugin/plugin.json`;
 const manifest = JSON.parse(await readFile(manifestPath, "utf8"));

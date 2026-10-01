@@ -14,6 +14,8 @@ await writeFile(new URL("../plugins/apple-device-hub/.codex-plugin/plugin.json",
   ...identity, skills: "./skills/", interface: presentation, mcpServers: "./.mcp.json", extensions: { "com.openai": openai },
 }, null, 2) + "\n");
 // A Git-installed plugin has no build output; it runs the published server of the same version.
-await writeFile(new URL("../plugins/apple-device-hub/.mcp.json", import.meta.url), JSON.stringify({
-  mcpServers: { "apple-device-hub": { command: "npx", args: ["--yes", `apple-device-hub-mcp@${version}`] } },
+const server = { command: "npx", args: ["--yes", `apple-device-hub-mcp@${version}`] };
+await writeFile(new URL("../plugins/apple-device-hub/.mcp.json", import.meta.url), JSON.stringify({ mcpServers: { "apple-device-hub": server } }, null, 2) + "\n");
+await writeFile(new URL("../plugins/apple-device-hub/mcp.json", import.meta.url), JSON.stringify({
+  $schema: "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json", mcpServers: { "apple-device-hub": { type: "stdio", ...server } },
 }, null, 2) + "\n");

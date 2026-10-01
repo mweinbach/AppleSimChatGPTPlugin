@@ -15,11 +15,12 @@ const { version } = JSON.parse(await readFile(new URL("../package.json", import.
 const archive = `${destination}apple-device-hub-${version}.zip`;
 const stage = await mkdtemp(join(tmpdir(), "apple-device-hub-zip-"));
 try {
-  const files = ["plugin.json", "mcp.json", ".codex-plugin", "dist", "skills", "assets", "README.md", "LICENSE.mcp-extensions"];
+  const files = ["plugin.json", ".codex-plugin", "dist", "skills", "assets", "README.md", "LICENSE.mcp-extensions"];
   for (const file of files) await cp(join(root, "plugins/apple-device-hub", file), join(stage, file), { recursive: true });
   await writeFile(join(stage, ".mcp.json"), JSON.stringify({ mcpServers: { "apple-device-hub": { command: "node", args: ["./dist/server.js"], cwd: "." } } }, null, 2) + "\n");
+  await writeFile(join(stage, "mcp.json"), JSON.stringify({ $schema: "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json", mcpServers: { "apple-device-hub": { type: "stdio", command: "node", args: ["./dist/server.js"], cwd: "./" } } }, null, 2) + "\n");
   await rm(archive, { force: true });
-  const zip = spawnSync("zip", ["-q", "-r", archive, ...files, ".mcp.json"], { cwd: stage, stdio: "inherit" });
+  const zip = spawnSync("zip", ["-q", "-r", archive, ...files, ".mcp.json", "mcp.json"], { cwd: stage, stdio: "inherit" });
   if (zip.status !== 0) process.exit(zip.status || 1);
 } finally {
   await rm(stage, { recursive: true, force: true });

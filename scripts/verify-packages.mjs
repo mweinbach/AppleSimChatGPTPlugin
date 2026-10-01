@@ -58,6 +58,7 @@ const manifest = JSON.parse(await readFile(join(plugin, ".codex-plugin", "plugin
 assert.equal(manifest.version, version);
 assert.equal(JSON.parse(await readFile(join(plugin, "plugin.json"), "utf8")).version, version);
 assert.deepEqual(JSON.parse(await readFile(join(plugin, manifest.mcpServers), "utf8")).mcpServers["apple-device-hub"], { command: "npx", args: ["--yes", `${name}@${version}`] });
+assert.deepEqual(JSON.parse(await readFile(join(plugin, "mcp.json"), "utf8")).mcpServers["apple-device-hub"], { type: "stdio", command: "npx", args: ["--yes", `${name}@${version}`] });
 const tracked = execFileSync("git", ["ls-files", "plugins/apple-device-hub"], { cwd: root, encoding: "utf8" }).trim().split("\n");
 assert.ok(!tracked.some(file => file.includes("/dist/")), "The plugin's server comes from npm, not committed build output");
 const skills = await readdir(join(plugin, "skills"));

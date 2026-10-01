@@ -3,7 +3,7 @@
 View and control Apple simulators and connected devices from ChatGPT on your Mac. The plugin contains:
 
 - `skills/` — how the agent drives a device, tests an app, and reviews accessibility.
-- `.mcp.json` — starts the `apple-device-hub-mcp` server of the same version with `npx`.
+- `.mcp.json` (Codex) and `mcp.json` (Agent Plugins) — start the `apple-device-hub-mcp` server of the same version with `npx`.
 - `.codex-plugin/plugin.json` and `plugin.json` — manifest, listing and review metadata.
 
 Requires an Apple Silicon Mac, macOS 14+, Node 22+, and Xcode 27 with **Settings → Intelligence → Model Context Protocol** enabled.
