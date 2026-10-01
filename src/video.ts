@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { fileURLToPath } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
-import type { DeviceActivity, LiveInput } from "./shared.js";
+import type { DeviceActivity, DeviceFocus, LiveInput } from "./shared.js";
 import { declareH264DecodeOrder, inspectVideoAccessUnit, provisionalCodec, type VideoCodec } from "./video-codec.js";
 
 /** The helper encodes each frame the simulator renders, which is 60 Hz on current runtimes. */
@@ -28,6 +28,8 @@ export interface VideoBatch {
   active: true;
   /** Device actions since the previous batch, added by the hub. */
   activity?: DeviceActivity[];
+  /** Another device the agent connected since; the viewer follows it. */
+  focus?: DeviceFocus;
 }
 
 /** Native stdout is length-prefixed Annex B access units, independent of pipe chunk boundaries. */

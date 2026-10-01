@@ -2,12 +2,14 @@ import { App } from "@modelcontextprotocol/ext-apps";
 import { version } from "./version.js";
 import { applyDocumentTheme, applyHostStyleVariables } from "@modelcontextprotocol/ext-apps/app-with-deps";
 import { OpenAIExtensions, OPENAI_MODEL_CONTEXT_KEY } from "@openai/mcp-extensions/app";
-import { HIERARCHY_META_KEY, sessionSchema, type CaptureState, type DeviceAction, type DeviceActivity, type DeviceSettings, type HubState, type LiveInput, type Session } from "./shared.js";
+import { DATA_META_KEY, HIERARCHY_META_KEY, sessionSchema, type CaptureState, type DeviceAction, type DeviceActivity, type DeviceFocus, type DeviceSettings, type HubState, type LiveInput, type Session } from "./shared.js";
 import { screenToDevicePoint } from "./screen-mapping.js";
 import { coordinateSpaceMatchesFrame, SimulatorVideoPlayer, type SimulatorStream, type SimulatorVideoTransport } from "./video-player.js";
 import { preferredVideoCodec, type VideoCodec } from "./video-codec.js";
 
 type ToolResult = Awaited<ReturnType<App["callServerTool"]>>;
+/** Results the model also reads keep the viewer's state in _meta; app-only results use structuredContent. */
+const resultData = (result: ToolResult) => (result._meta?.[DATA_META_KEY] ?? result.structuredContent) as Record<string, unknown> | undefined;
 type ScreenImage = { type: "image"; data: string; mimeType: "image/png" | "image/jpeg" };
 type PreviewWindow = Window & { __APPLE_DEVICE_HUB_PREVIEW__?: boolean };
 
@@ -255,12 +257,13 @@ function videoTransport(stream: SimulatorStream): SimulatorVideoTransport {
     async read() {
       const result = await callTool("device_stream_read", { sessionId: stream.sessionId, streamId: stream.streamId });
       if (stopped) return [];
-      const batch = result._meta?.["apple-device-hub/video"] as { sessionId?: string; streamId?: string; sequence?: unknown; frames?: unknown; active?: boolean; activity?: unknown } | undefined;
+      const batch = result._meta?.["apple-device-hub/video"] as { sessionId?: string; streamId?: string; sequence?: unknown; frames?: unknown; active?: boolean; activity?: unknown; focus?: DeviceFocus } | undefined;
       if (!batch || batch.sessionId !== stream.sessionId || batch.streamId !== stream.streamId || batch.active !== true || !Array.isArray(batch.frames) || !batch.frames.every(frame => typeof frame === "string")) throw new Error("Device Hub returned an incomplete video batch.");
       // A lost or repeated batch breaks the decoder's reference chain.
       if (batch.sequence !== sequence) throw new Error("Device Hub video batches arrived out of order.");
       sequence++;
       if (Array.isArray(batch.activity)) receiveActivity(stream.sessionId, batch.activity);
+      followFocus(batch.focus);
       return (batch.frames as string[]).map(decodeBase64);
     },
     stop() {
@@ -512,6 +515,7 @@ async function run(operation: () => Promise<void>, message?: string) {
     busy = false;
     updateControls();
     schedulePoll();
+    startPendingSwitch();
   }
 }
 
@@ -524,9 +528,16 @@ function applyHub(next: HubState) {
     else clearSession();
   }
   if (!session) {
+    const focus = next.focus;
+    const focused = focus && hub.sessions.find(item => item.device.id === focus.deviceId);
     const matching = hub.sessions.filter(item => item.device.id === selected);
-    const nextSession = matching.length === 1 ? matching[0] : hub.sessions.length === 1 ? hub.sessions[0] : undefined;
+    const nextSession = focused ?? (matching.length === 1 ? matching[0] : hub.sessions.length === 1 ? hub.sessions[0] : undefined);
     if (nextSession) selectSession(nextSession);
+    else if (focus && !joinedOnOpen && next.elsewhere?.some(item => item.deviceId === focus.deviceId)) {
+      // The agent is driving a device from another chat or window; show it here too.
+      joinedOnOpen = true;
+      requestSwitch(focus.deviceId, `Joining ${focus.deviceName}…`);
+    }
   }
   selectedDeviceId = session?.device.id ?? (hub.devices.some(item => item.id === selected) ? selected : "");
   if (!selectedDeviceId) {
@@ -583,7 +594,7 @@ function clearSession() {
 
 function applyCapture(result: ToolResult, epoch = lifecycle) {
   if (ended || epoch !== lifecycle) return;
-  const structured = result.structuredContent as unknown as CaptureState | undefined;
+  const structured = resultData(result) as unknown as CaptureState | undefined;
   const hierarchy = result._meta?.[HIERARCHY_META_KEY];
   const next = structured && typeof hierarchy === "string" ? { ...structured, hierarchy } : structured;
   const image = result.content.find(item => item.type === "image" && (item.mimeType === "image/png" || item.mimeType === "image/jpeg"));
@@ -631,11 +642,46 @@ async function refreshLive() {
   if (!session) {
     await run(async () => {
       const result = await callTool("device_hub_status", {});
-      applyHub(result.structuredContent as unknown as HubState);
+      applyHub(resultData(result) as unknown as HubState);
     });
     return;
   }
   await streamFrame(session);
+}
+
+/** When the viewer opened, or last chose or followed a device; it follows only later focus changes. */
+let focusHandledAt = new Date().toISOString();
+/** On opening, the viewer may join a device another chat or window is driving, once. */
+let joinedOnOpen = false;
+
+/** Follows the device the agent connected most recently, in this chat or another. */
+function followFocus(focus?: DeviceFocus) {
+  if (!focus || !session || ended || disconnecting || focus.deviceId === session.device.id || focus.at <= focusHandledAt) return;
+  focusHandledAt = focus.at;
+  requestSwitch(focus.deviceId, `Following the agent to ${focus.deviceName}…`);
+}
+
+let pendingSwitch: { deviceId: string; message: string } | undefined;
+/** Switches once the current operation, such as the read that reported the focus, has finished. */
+function requestSwitch(deviceId: string, message: string) {
+  pendingSwitch = { deviceId, message };
+  if (!busy) startPendingSwitch();
+}
+function startPendingSwitch() {
+  const next = pendingSwitch;
+  if (!next || ended) return;
+  pendingSwitch = undefined;
+  queueMicrotask(() => void switchToDevice(next.deviceId, next.message));
+}
+
+async function switchToDevice(deviceId: string, message: string) {
+  await run(async () => {
+    const result = await callTool("device_connect", { deviceId });
+    if (ended) return;
+    focusHandledAt = new Date().toISOString();
+    selectSession(sessionSchema.parse(resultData(result)));
+    await captureCurrent();
+  }, message);
 }
 
 /**
@@ -658,6 +704,7 @@ async function streamFrame(current: Session) {
     }
     if (generation !== frameGeneration || epoch !== lifecycle || busy) return;
     applyCapture(result, epoch);
+    followFocus(resultData(result)?.focus as DeviceFocus | undefined);
     frameFailures = 0;
     if (settle) { staleSince = undefined; lastFrameUnchanged = false; }
     else if (image?.type === "image") {
@@ -757,7 +804,7 @@ function receiveResult(result: ToolResult) {
     showNotice(resultError(result), true);
     return;
   }
-  const value = result.structuredContent;
+  const value = resultData(result);
   if (value && Array.isArray(value.devices) && Array.isArray(value.sessions) && Array.isArray(value.warnings)) {
     applyHub(value as unknown as HubState);
     if (initialized && session && !capture) void refreshCapture();
@@ -793,6 +840,9 @@ export async function toggleConnection() {
       stopVideo();
       try {
         await callTool("device_disconnect", { sessionId: current.id });
+        // Choosing to disconnect also stops following whatever the agent connected before now.
+        focusHandledAt = new Date().toISOString();
+        joinedOnOpen = true;
         clearSession();
         hub = { ...hub, sessions: hub.sessions.filter(item => item.id !== current.id) };
         showNotice("Disconnected. The device remains available.");
@@ -800,7 +850,8 @@ export async function toggleConnection() {
     } else {
       const result = await callTool("device_connect", { deviceId: selectedDeviceId });
       if (ended) return;
-      selectSession(sessionSchema.parse(result.structuredContent));
+      focusHandledAt = new Date().toISOString();
+      selectSession(sessionSchema.parse(resultData(result)));
       await captureCurrent();
     }
   }, session ? "Disconnecting device…" : "Connecting device…");
@@ -809,7 +860,7 @@ export async function toggleConnection() {
 export async function scanDevices() {
   await run(async () => {
     const result = await callTool("device_hub_status", {});
-    applyHub(result.structuredContent as unknown as HubState);
+    applyHub(resultData(result) as unknown as HubState);
     if (session && !capture) await captureCurrent();
     else if (session) showNotice("Device list refreshed.");
   }, "Finding devices…");

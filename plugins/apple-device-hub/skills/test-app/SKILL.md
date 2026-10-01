@@ -9,6 +9,8 @@ Follow the device-hub skill for connecting and for the observe → act loop.
 
 ## Get the app running
 
+Test on a fresh simulator from `simulator_create` unless the user names one, so first-launch state is real and their own data stays untouched; delete it with `simulator_delete` afterwards.
+
 Apple Device Hub does not build apps. If the app is not installed and you can run shell commands, build and install it for the connected simulator, using its `id` from `device_hub_status`:
 
 ```sh

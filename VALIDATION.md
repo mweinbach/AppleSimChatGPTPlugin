@@ -387,3 +387,33 @@ at the bottom right, plus 700 × 560, 420 × 880 and 1360 × 860, in light and d
 At 840 × 490 the device rendered about 410 px tall, the controls sat in the top
 bar, the Elements and Appearance column ended above the inset, and nothing
 interactive sat under the composer. The suite passed **132 tests**.
+
+## Shared sessions, spawned simulators, and model-visible results — September 30, 2026
+
+Probed against Xcode 27.2's bridge on the separate iPhone 17 simulator:
+
+- **One session per device.** A second `DeviceInteractionStartSession` failed with “The target device is already in use by a different session with key '<name>'”.
+- **Keys are names.** The key is exactly the `sessionIdentifier` passed in. It worked from another bridge connection, and after the creating connection closed, so a session outlives the server that started it.
+- **Ending.** `EndSession` with that name ended it. A name cannot be reused right away, and a call on an ended session reports “Session not found”.
+- **Error format.** Errors arrive as text content shaped like `{"type":"error","data":"…"}`.
+- **Simulators.** `simctl create` took about 1 s; `simctl clone` refuses a booted source.
+
+Codex's `CallToolResult::as_function_call_output_payload`
+(`codex-rs/protocol/src/models.rs`) gives the model only the serialized
+`structuredContent` when a result has one. Capture results had carried their
+state there, so a Codex model received the session, coordinate space and snapshot
+number but neither the element list nor the screenshot. Results the model reads
+now return text and images only, with the viewer's state in `_meta`.
+
+Two built servers, standing in for two chats, plus a raw bridge client standing in for another tool, ran these checks:
+
+| Check | Result |
+| --- | --- |
+| Server B connects a device server A holds | Joined A's session in 518 ms; B observed the screen |
+| A disconnects | B kept observing; B's disconnect then ended the session |
+| Server C connects, then is killed with `SIGKILL` | B adopted C's session and ended it on disconnect |
+| Another tool holds the device | Refused without `takeOver`; joined with it; the other tool's session stayed open after B left |
+| `simulator_create` with `deviceType: "iPhone 17 Pro"` | Created, booted and connected in 17.5 s; observed in 1.4 s |
+| `simulator_delete` | Deleted the created simulator in 3.9 s; refused the user's iPhone 17 |
+
+In headless Chrome, a viewer served by one server followed a model working through another server. The model's `simulator_create` moved the viewer to the new simulator, and its `device_connect` moved the viewer back in 1.1 s. Deleting the created simulator left the viewer on the iPhone 17. A viewer opened later from a third server joined the device the model held in 1.3 s. Registry entries are discarded after a reboot, and viewers follow only focus changes made after they open, so a stale focus cannot boot a device. The suite passed **143 tests**.

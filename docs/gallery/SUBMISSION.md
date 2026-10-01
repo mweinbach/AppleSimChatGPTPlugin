@@ -58,12 +58,13 @@ No review submission, publication, verified identity, demo credentials or platfo
 
 ## Annotation rationale
 
-All 19 MCP tools advertise explicit `readOnlyHint`, `destructiveHint` and `openWorldHint` booleans. The current guidelines say annotation justifications are no longer required, while the submission-error page still lists them; this rationale is available if the portal/reviewer asks.
+All 22 MCP tools advertise explicit `readOnlyHint`, `destructiveHint` and `openWorldHint` booleans. The current guidelines say annotation justifications are no longer required, while the submission-error page still lists them; this rationale is available if the portal/reviewer asks.
 
 | Tools | Rationale |
 | --- | --- |
 | `open_device_hub`, `device_hub_preferences`, `device_hub_status`, `device_capture`, `device_frame`, `device_stream_read`, `simulator_get_state`, `simulator_screenshot` | Observe state or present/read the local viewer; no direct destructive action or arbitrary external destination. Temporary processing and session bookkeeping are internal. |
-| `device_connect`, `device_stream` | Start stateful sessions/video jobs, so not read-only. These create resources without deleting user data and remain scoped to local devices. |
+| `device_connect`, `device_stream`, `simulator_create` | Start stateful sessions/video jobs or create a local simulator, so not read-only. These create resources without deleting user data and remain scoped to local devices; joining another tool's device session requires an explicit `takeOver`. |
+| `simulator_delete` | Deletes a simulator and its data, so marked destructive. Limited to simulators Device Hub created. |
 | `device_stream_stop`, `device_disconnect` | Cancel/release stateful resources and revoke capabilities, so not read-only and marked destructive; destinations remain local and session-bound. |
 | `device_settings` | Overwrites persistent device preferences, so not read-only and marked destructive. Limited to enumerated settings on the connected device. |
 | `simulator_scroll` | Changes the visible scroll position, so not read-only. The operation does not submit app data or delete it. |

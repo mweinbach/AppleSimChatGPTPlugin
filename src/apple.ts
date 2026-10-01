@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { version } from './version.js';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,8 +9,12 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import { resolveElement, summarizeHierarchy, type Rect, type ScreenElement } from './elements.js';
-import { actionSchema, settingsSchema, textSizeSchema, type Capture, type Device, type DeviceAction, type DeviceActivity, type DeviceSettings, type ElementTarget, type HubState, type LiveInput, type ScreenshotMode, type Session } from './shared.js';
+import { actionSchema, settingsSchema, textSizeSchema, type Capture, type ConnectedSession, type Device, type DeviceAction, type DeviceActivity, type DeviceFocus, type DeviceSettings, type ElementTarget, type HubState, type LiveInput, type ScreenshotMode, type Session, type SessionOrigin } from './shared.js';
+import { SessionRegistry } from './session-registry.js';
 import { SimulatorVideo, type VideoBatch, type VideoStream } from './video.js';
+
+/** Every Device Hub session name starts with this, so another server can recognize one left by a crashed server. */
+const SESSION_LABEL = 'Apple Device Hub';
 
 /** Xcode answers ordinary requests in well under a second. */
 const XCODE_TIMEOUT_MS = 40_000;
@@ -96,7 +100,12 @@ type ObjectValue = Record<string, any>;
 export function appleToolData(result: unknown): ObjectValue {
   const response = result as ObjectValue;
   const text = (response.content ?? []).filter((item: ObjectValue) => item.type === 'text').map((item: ObjectValue) => item.text).join('\n');
-  if (response.isError) throw new Error(text || 'Xcode device interaction failed.');
+  if (response.isError) {
+    // Xcode wraps errors as {"type":"error","data":"…"}.
+    let message = text;
+    try { const parsed = JSON.parse(text) as ObjectValue; if (typeof parsed.data === 'string') message = parsed.data; } catch { /* plain text */ }
+    throw new Error(message || 'Xcode device interaction failed.');
+  }
   if (response.structuredContent) return response.structuredContent as ObjectValue;
   try {
     return JSON.parse(text) as ObjectValue;
@@ -203,6 +212,38 @@ export function simulatorDevices(json: string): Device[] {
   });
 }
 
+const versionParts = (version: unknown) => String(version ?? '0').split('.').map(Number);
+const newerFirst = (left: unknown, right: unknown) => {
+  const [a, b] = [versionParts(left), versionParts(right)];
+  for (let index = 0; index < Math.max(a.length, b.length); index++) if ((a[index] ?? 0) !== (b[index] ?? 0)) return (b[index] ?? 0) - (a[index] ?? 0);
+  return 0;
+};
+
+/**
+ * Resolves a device type name such as "iPhone 17 Pro", and optionally a
+ * runtime such as "iOS 27.2", "iOS 27" or "27.2", against `simctl list
+ * runtimes -j`. Without a runtime, the newest one supporting the type wins.
+ */
+export function resolveSimulatorType(json: string, deviceType: string, runtime?: string): { deviceType: { name: string; identifier: string }; runtime: { name: string; identifier: string } } {
+  const runtimes = ((JSON.parse(json) as { runtimes?: ObjectValue[] }).runtimes ?? []).filter(item => item.isAvailable);
+  const wantedRuntime = runtime?.trim().toLowerCase();
+  const matching = runtimes.filter(item => !wantedRuntime
+    || [item.name, item.identifier, item.version, item.platform].some(value => typeof value === 'string' && value.toLowerCase() === wantedRuntime)
+    || String(item.name ?? '').toLowerCase().startsWith(`${wantedRuntime}.`));
+  if (!matching.length) throw new Error(`No installed simulator runtime matches “${runtime}”. Installed: ${runtimes.map(item => item.name).join(', ') || 'none'}.`);
+  const wanted = deviceType.trim().toLowerCase();
+  const found = matching
+    .flatMap(item => (item.supportedDeviceTypes ?? [] as ObjectValue[])
+      .filter((type: ObjectValue) => String(type.name).toLowerCase() === wanted || String(type.identifier).toLowerCase() === wanted)
+      .map((type: ObjectValue) => ({ runtime: item, type })))
+    .sort((left, right) => newerFirst(left.runtime.version, right.runtime.version))[0];
+  if (!found) {
+    const names = [...new Set(matching.flatMap(item => (item.supportedDeviceTypes ?? []).map((type: ObjectValue) => type.name as string)))];
+    throw new Error(`“${deviceType}” is not a simulator type for ${runtime ?? 'the installed runtimes'}. Choose one of: ${names.join(', ')}.`);
+  }
+  return { deviceType: { name: found.type.name, identifier: found.type.identifier }, runtime: { name: found.runtime.name, identifier: found.runtime.identifier } };
+}
+
 export function physicalDevices(json: string): Device[] {
   const result = JSON.parse(json) as { result: { devices: ObjectValue[] } };
   return result.result.devices.filter((device) => {
@@ -243,7 +284,9 @@ export function appearanceSettings(json: string): DeviceSettings | undefined {
 
 interface NativeSession {
   public: Session;
+  /** Xcode's session key, which is also its name; any process that knows it can use the session. */
   key: string;
+  origin: Exclude<SessionOrigin, 'this-server'>;
   coordinateSpace?: { width: number; height: number };
   deviceOrientation?: string;
   snapshot?: { id: number; key: string; bundleId?: string; elements: ScreenElement[] };
@@ -280,6 +323,20 @@ export interface AppleHubOptions {
   /** How long a request may wait on a device before it returns an error. */
   operationDeadlineMs?: number;
   video?: SimulatorVideo;
+  registry?: SessionRegistry;
+}
+
+export interface ConnectOptions {
+  /** Join a session another tool holds on the device. */
+  takeOver?: boolean;
+}
+
+export interface CreateSimulatorOptions {
+  deviceType?: string;
+  runtime?: string;
+  name?: string;
+  /** Copy a shut-down simulator, including its apps and data. */
+  cloneFrom?: string;
 }
 
 export class SessionExpiredError extends Error {
@@ -295,7 +352,10 @@ export class AppleHub {
   private readonly idleTimeoutMs: number;
   private readonly operationDeadlineMs: number;
   private readonly sessions = new Map<string, NativeSession>();
-  private readonly connecting = new Map<string, Promise<Session>>();
+  private readonly connecting = new Map<string, Promise<ConnectedSession>>();
+  private readonly registry: SessionRegistry;
+  /** The registry's focus, re-read at most once a second because video reads ask for it at frame rate. */
+  private focusCache?: { value?: DeviceFocus; readAt: number; reading?: Promise<void> };
   private closed = false;
   private closing?: Promise<void>;
   private snapshots = 0;
@@ -308,6 +368,7 @@ export class AppleHub {
     this.boundary = options.boundary ?? new NativeAppleBoundary();
     this.idleTimeoutMs = options.idleTimeoutMs ?? 5 * 60_000;
     this.operationDeadlineMs = options.operationDeadlineMs ?? OPERATION_DEADLINE_MS;
+    this.registry = options.registry ?? new SessionRegistry();
     this.video = options.video ?? new SimulatorVideo({
       helper: new URL(import.meta.url.endsWith('/src/apple.ts') ? '../plugins/apple-device-hub/dist/simulator-stream' : './simulator-stream', import.meta.url),
       keepAlive: id => this.keepVideoSessionAlive(id),
@@ -345,9 +406,10 @@ export class AppleHub {
       this.videoSession(sessionId);
       const cursor = this.activityCursors.get(streamId);
       const activity = cursor ? session.activity.filter(item => item.id > cursor.delivered) : [];
-      if (!activity.length) return batch;
-      cursor!.delivered = activity.at(-1)!.id;
-      return { ...batch, activity };
+      if (activity.length) cursor!.delivered = activity.at(-1)!.id;
+      const focus = this.otherFocus(session);
+      if (!activity.length && !focus) return batch;
+      return { ...batch, ...(activity.length ? { activity } : {}), ...(focus ? { focus } : {}) };
     } catch (error) {
       // Closing a device also closes its pending relay read. Preserve the
       // session-expired result so the viewer can clear the disconnected screen.
@@ -400,62 +462,173 @@ export class AppleHub {
   }
 
   private async deviceList(): Promise<{ devices: Device[]; warnings: string[] }> {
-    const results = await Promise.allSettled([
+    const [simulators, physical, created] = await Promise.allSettled([
       this.boundary.command(['simctl', 'list', 'devices', '-j']).then(simulatorDevices),
       this.deviceJson(['list', 'devices']).then(physicalDevices),
+      this.registry.createdDevices(),
     ]);
     const devices: Device[] = [];
     const warnings: string[] = [];
-    results.forEach((result, index) => {
+    [simulators, physical].forEach((result, index) => {
       if (result.status === 'fulfilled') devices.push(...result.value);
       else warnings.push(`${index === 0 ? 'Simulator' : 'Physical device'} discovery failed: ${String(result.reason)}`);
     });
-    return { devices, warnings };
+    const ours = new Set(created.status === 'fulfilled' ? created.value : []);
+    return { devices: devices.map(device => ours.has(device.id) ? { ...device, createdByHub: true } : device), warnings };
   }
 
   async status(): Promise<HubState> {
-    const discovered = await this.deviceList();
-    return { ...discovered, sessions: [...this.sessions.values()].filter((session) => !session.closing).map((session) => this.publicSession(session)) };
+    const [discovered, elsewhere, focus] = await Promise.all([
+      this.deviceList(),
+      this.registry.elsewhere().catch(() => []),
+      this.registry.focus().catch(() => undefined),
+    ]);
+    return {
+      ...discovered,
+      sessions: [...this.sessions.values()].filter((session) => !session.closing).map((session) => this.publicSession(session)),
+      elsewhere: elsewhere.map(session => ({ deviceId: session.deviceId, deviceName: session.deviceName, holders: session.holders.length, ...(session.foreign ? { otherTool: true } : {}) })),
+      ...(focus ? { focus: { deviceId: focus.deviceId, deviceName: focus.deviceName, at: focus.at } } : {}),
+    };
   }
 
-  async connect(deviceId: string): Promise<Session> {
+  /**
+   * Opens a session, reusing this server's session for the device or joining
+   * the one another Device Hub server holds. Viewers follow the connected device.
+   */
+  async connect(deviceId: string, options: ConnectOptions = {}): Promise<ConnectedSession> {
     if (this.closed) throw new Error('Apple Device Hub is closed.');
     const existing = [...this.sessions.values()].find((session) => session.public.device.id === deviceId && !session.closing);
-    if (existing) return this.publicSession(existing);
+    if (existing) {
+      await this.focusOn(existing.public.device);
+      return { ...this.publicSession(existing), origin: 'this-server' };
+    }
     const pending = this.connecting.get(deviceId);
     if (pending) return pending;
-    const connection = this.startSession(deviceId);
+    const connection = this.startSession(deviceId, options);
     this.connecting.set(deviceId, connection);
     try { return await connection; }
     finally { this.connecting.delete(deviceId); }
   }
 
-  private async startSession(deviceId: string): Promise<Session> {
+  private async startSession(deviceId: string, { takeOver = false }: ConnectOptions, retried = false): Promise<ConnectedSession> {
     const { devices, warnings } = await this.deviceList();
     if (this.closed) throw new Error('Apple Device Hub is closed.');
     const device = devices.find((candidate) => candidate.id === deviceId);
     if (!device) throw new Error(`Device is not in the local device list. ${warnings.join(' ')}`.trim());
     if (!device.available) throw new Error(`${device.name} is unavailable. Connect and pair the device, or install its simulator runtime.`);
     const sessionId = randomUUID();
-    const data = appleToolData(await this.boundary.tool('DeviceInteractionStartSession', {
-      deviceIdentifier: device.id, sessionIdentifier: `Apple Device Hub ${sessionId.slice(0, 8).toUpperCase()}`,
-    }));
-    if (!data.interactionSessionKey) throw new Error('Xcode returned no device interaction session key.');
+    let key: string;
+    let origin: NativeSession['origin'] = 'new';
+    try {
+      const data = appleToolData(await this.boundary.tool('DeviceInteractionStartSession', {
+        deviceIdentifier: device.id, sessionIdentifier: `${SESSION_LABEL} ${randomBytes(4).toString('hex').toUpperCase()}`,
+      }));
+      if (!data.interactionSessionKey) throw new Error('Xcode returned no device interaction session key.');
+      key = data.interactionSessionKey;
+    } catch (error) {
+      // Xcode allows one session per device and names the session holding it.
+      const holder = error instanceof Error ? error.message.match(/in use by a different session with key '([^']+)'/)?.[1] : undefined;
+      if (!holder) throw error;
+      const shared = await this.registry.find(holder).catch(() => undefined);
+      origin = shared ? (shared.foreign ? 'other-tool' : 'device-hub') : holder.startsWith(SESSION_LABEL) ? 'device-hub' : 'other-tool';
+      if (origin === 'other-tool' && !shared && !takeOver) {
+        throw new Error(`${device.name} is in use by another tool's Xcode session, “${holder}”. Ask the user before taking it over: device_connect with takeOver: true joins that session so both can drive the device. Device Hub never ends a session it did not start.`);
+      }
+      key = holder;
+    }
     const session: NativeSession = {
       public: { id: sessionId, device: { ...device, state: device.kind === 'simulator' ? 'Booted' : device.state }, accessibilityEnabled: true },
-      key: data.interactionSessionKey, queue: Promise.resolve(), closing: false, pending: 0, activity: [],
+      key, origin, queue: Promise.resolve(), closing: false, pending: 0, activity: [],
     };
     this.sessions.set(session.public.id, session);
     try {
+      await this.registry.hold({ key, deviceId: device.id, deviceName: device.name, ...(origin === 'other-tool' ? { foreign: true } : {}) }, sessionId);
       // The initial native observation establishes logical coordinates even
       // when the user subsequently hides the accessibility tree.
       await this.serial(session.public.id, () => this.nativeCapture(session, {}, BOOT_TIMEOUT_MS), BOOT_TIMEOUT_MS + 10_000);
       if (this.closed || session.closing) throw new SessionExpiredError();
-      return this.publicSession(session);
+      await this.focusOn(device);
+      return { ...this.publicSession(session), origin };
     } catch (error) {
       await this.disconnect(session.public.id).catch(() => {});
+      // A joined session can end between Xcode naming it and the first observation.
+      if (error instanceof SessionExpiredError && origin !== 'new' && !retried && !this.closed) return this.startSession(deviceId, { takeOver }, true);
       throw error;
     }
+  }
+
+  private async focusOn(device: Device) {
+    this.focusCache = { value: { deviceId: device.id, deviceName: device.name, at: new Date().toISOString() }, readAt: Date.now() };
+    await this.registry.setFocus(device.id, device.name).catch(() => {});
+  }
+
+  /** The device the agent connected most recently, when it is not this session's. */
+  private otherFocus(session: NativeSession): DeviceFocus | undefined {
+    const cache = this.focusCache ??= { readAt: 0 };
+    if (Date.now() - cache.readAt > 1000 && !cache.reading) {
+      cache.reading = this.registry.focus().then(focus => {
+        cache.value = focus && { deviceId: focus.deviceId, deviceName: focus.deviceName, at: focus.at };
+      }, () => {}).finally(() => { cache.readAt = Date.now(); cache.reading = undefined; });
+    }
+    return cache.value && cache.value.deviceId !== session.public.device.id ? cache.value : undefined;
+  }
+
+  /** Xcode ended the session, through another tool or a restart, so there is nothing left to end. */
+  private expire(session: NativeSession) {
+    if (session.closing) return;
+    session.closing = true;
+    clearTimeout(session.timer);
+    this.video.closeSession(session.public.id);
+    for (const [streamId, cursor] of this.activityCursors) if (cursor.sessionId === session.public.id) this.activityCursors.delete(streamId);
+    this.sessions.delete(session.public.id);
+    void this.registry.release(session.key, session.public.id).catch(() => {});
+  }
+
+  /** Creates a simulator, or clones a shut-down one, and remembers it so deleteSimulator may remove it. */
+  async createSimulator(options: CreateSimulatorOptions): Promise<Device> {
+    if (this.closed) throw new Error('Apple Device Hub is closed.');
+    let id: string;
+    if (options.cloneFrom) {
+      const source = (await this.deviceList()).devices.find(device => device.id === options.cloneFrom && device.kind === 'simulator');
+      if (!source) throw new Error('cloneFrom must be a simulator ID from device_hub_status.');
+      if (source.state !== 'Shutdown') {
+        throw new Error(`${source.name} is ${source.state.toLowerCase()}, and Xcode clones only shut-down simulators. Create a fresh simulator with deviceType instead, or ask the user before shutting it down.`);
+      }
+      id = (await this.boundary.command(['simctl', 'clone', source.id, options.name ?? `${source.name} (Device Hub)`], 120_000)).trim();
+    } else {
+      if (!options.deviceType) throw new Error('Choose a deviceType, such as "iPhone 17 Pro", or a simulator to clone.');
+      const { deviceType, runtime } = resolveSimulatorType(await this.boundary.command(['simctl', 'list', 'runtimes', '-j']), options.deviceType, options.runtime);
+      id = (await this.boundary.command(['simctl', 'create', options.name ?? `${deviceType.name} (Device Hub)`, deviceType.identifier, runtime.identifier])).trim();
+    }
+    if (!/^[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}$/i.test(id)) throw new Error(`Xcode did not return a new simulator ID. ${id}`.trim());
+    await this.registry.markCreated(id);
+    const device = (await this.deviceList()).devices.find(candidate => candidate.id === id);
+    if (!device) throw new Error('The new simulator did not appear in the device list.');
+    return device;
+  }
+
+  /**
+   * Deletes a simulator this hub created; any other simulator belongs to the
+   * user. Its session ends for every holder, so a viewer in another chat or
+   * window that followed it reports the session ended on its next request.
+   */
+  async deleteSimulator(deviceId: string): Promise<Device> {
+    const device = (await this.deviceList()).devices.find(candidate => candidate.id === deviceId && candidate.kind === 'simulator');
+    if (!device) throw new Error('That simulator is not in the device list.');
+    if (!device.createdByHub) throw new Error(`${device.name} was not created by Device Hub, so Device Hub will not delete it.`);
+    const local = [...this.sessions.values()].filter(session => session.public.device.id === deviceId);
+    const shared = await this.registry.forDevice(deviceId).catch(() => []);
+    for (const key of new Set([...local.map(session => session.key), ...shared.map(session => session.key)])) {
+      await this.boundary.tool('DeviceInteractionEndSession', { interactionSessionKey: key }).catch(() => {});
+      await this.registry.drop(key).catch(() => {});
+    }
+    for (const session of local) this.expire(session);
+    if (device.state !== 'Shutdown') await this.boundary.command(['simctl', 'shutdown', deviceId], 60_000).catch(() => {});
+    await this.boundary.command(['simctl', 'delete', deviceId], 60_000);
+    await this.registry.forgetCreated(deviceId);
+    await this.registry.clearFocus(deviceId);
+    if (this.focusCache?.value?.deviceId === deviceId) this.focusCache = undefined;
+    return device;
   }
 
   private async serial<T>(sessionId: string, operation: (session: NativeSession) => Promise<T>, deadlineMs = this.operationDeadlineMs): Promise<T> {
@@ -557,9 +730,18 @@ export class AppleHub {
     let failure = new Error('Xcode accessibility hierarchy is temporarily unavailable; the device may still be starting. Observe again in a few seconds.');
     for (let attempt = 0; attempt < 3; attempt++) {
       if (attempt) await new Promise(resolve => setTimeout(resolve, 300));
-      const data = appleToolData(await this.boundary.tool('DeviceInteractionSynthesize', {
-        interactSessionKey: session.key, interactionCommand: '', ...(attempt === 0 ? args : {}),
-      }, timeoutMs));
+      let data: ObjectValue;
+      try {
+        data = appleToolData(await this.boundary.tool('DeviceInteractionSynthesize', {
+          interactSessionKey: session.key, interactionCommand: '', ...(attempt === 0 ? args : {}),
+        }, timeoutMs));
+      } catch (error) {
+        if (error instanceof Error && /Session not found/i.test(error.message)) {
+          this.expire(session);
+          throw new SessionExpiredError();
+        }
+        throw error;
+      }
       if (!data.hierarchyPath) continue;
       const hierarchy = await readFile(data.hierarchyPath, 'utf8');
       const image = await readFile(data.screenshotPath);
@@ -667,11 +849,13 @@ export class AppleHub {
           const enabled = session.public.accessibilityEnabled;
           return this.captureResult(session, await this.nativeCapture(session), enabled, { resolution: 'full' });
         }
+        const focus = this.otherFocus(session);
         return {
           session: this.publicSession(session), capturedAt: new Date().toISOString(),
           screenshot: { ...info, data: image.toString('base64') },
           coordinateSpace: { ...viewport },
           ...(session.deviceOrientation ? { deviceOrientation: session.deviceOrientation } : {}),
+          ...(focus ? { focus } : {}),
         };
       } finally {
         await rm(directory, { recursive: true, force: true });
@@ -822,8 +1006,12 @@ export class AppleHub {
     this.video.closeSession(sessionId);
     for (const [streamId, cursor] of this.activityCursors) if (cursor.sessionId === sessionId) this.activityCursors.delete(streamId);
     const ending = session.queue.then(async () => {
-      try { appleToolData(await this.boundary.tool('DeviceInteractionEndSession', { interactionSessionKey: session.key })); }
-      finally { this.sessions.delete(sessionId); }
+      try {
+        // Another chat or window may still share the session; the last Device Hub holder ends it.
+        const { last, foreign } = await this.registry.release(session.key, sessionId)
+          .catch(() => ({ last: session.origin === 'new', foreign: session.origin === 'other-tool' }));
+        if (last && !foreign) appleToolData(await this.boundary.tool('DeviceInteractionEndSession', { interactionSessionKey: session.key }));
+      } finally { this.sessions.delete(sessionId); }
     });
     session.queue = ending.catch(() => {});
     await ending;

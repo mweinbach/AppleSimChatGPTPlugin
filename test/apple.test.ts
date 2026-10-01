@@ -4,8 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { readFileSync } from 'node:fs';
-import { AppleHub, SessionExpiredError, appleToolData, scrollFromPoint, scrollGesture, scrollRegion, appearanceSettings, imageInfo, jpegDimensions, keyboardCommand, logicalDimensions, physicalDevices, pngDimensions, simulatorDevices, type AppleBoundary } from '../src/apple.js';
+import { AppleHub, SessionExpiredError, appleToolData, resolveSimulatorType, scrollFromPoint, scrollGesture, scrollRegion, appearanceSettings, imageInfo, jpegDimensions, keyboardCommand, logicalDimensions, physicalDevices, pngDimensions, simulatorDevices, type AppleBoundary } from '../src/apple.js';
 import { actionSchema } from '../src/shared.js';
+import { SessionRegistry } from '../src/session-registry.js';
 import { SimulatorVideo, type VideoBatch } from '../src/video.js';
 
 const simulator = { udid: 'sim-1', name: 'iPhone', state: 'Shutdown', isAvailable: true };
@@ -48,6 +49,7 @@ async function fixture(t: TestContext, idleTimeoutMs = 60_000, video?: Simulator
   const calls: { name: string; args: Record<string, unknown> }[] = [];
   const commands: string[][] = [];
   let toolHook: ((name: string, args: Record<string, unknown>) => Promise<unknown | undefined>) | undefined;
+  let commandHook: ((args: string[]) => Promise<string | undefined>) | undefined;
   let screen = png();
   let compressed: Buffer | undefined;
   let appearance: Object | undefined = nativeAppearance;
@@ -55,6 +57,8 @@ async function fixture(t: TestContext, idleTimeoutMs = 60_000, video?: Simulator
   const boundary: AppleBoundary = {
     async command(args) {
       commands.push(args);
+      const override = await commandHook?.(args);
+      if (override !== undefined) return override;
       if (args[0] === 'simctl' && args[1] === 'list') return simulatorList;
       if (args[0] === 'devicectl' && args.includes('list')) {
         await writeFile(args[args.indexOf('--json-output') + 1]!, physicalList);
@@ -83,13 +87,15 @@ async function fixture(t: TestContext, idleTimeoutMs = 60_000, video?: Simulator
     },
     async close() { closed = true; },
   };
-  const hub = new AppleHub({ boundary, idleTimeoutMs, video, ...(operationDeadlineMs ? { operationDeadlineMs } : {}) });
+  const registry = new SessionRegistry(join(directory, 'registry'));
+  const hub = new AppleHub({ boundary, idleTimeoutMs, video, registry, ...(operationDeadlineMs ? { operationDeadlineMs } : {}) });
   t.after(async () => {
     try { if (!closed) await hub.close(); }
     finally { await rm(directory, { recursive: true, force: true }); }
   });
-  return { hub, boundary, calls, commands, screenshotPath, hierarchyPath,
+  return { hub, boundary, calls, commands, screenshotPath, hierarchyPath, registry, directory,
     setToolHook(hook: typeof toolHook) { toolHook = hook; },
+    setCommandHook(hook: typeof commandHook) { commandHook = hook; },
     setScreen(value: Buffer) { screen = value; },
     setAppearance(value: Object | undefined) { appearance = value; },
     setCompressed(value: Buffer | undefined) { compressed = value; },
@@ -772,4 +778,118 @@ test('live input reaches the simulator helper without Xcode or the serial device
   assert.equal(f.calls.length, calls);
   release();
   await observing;
+});
+
+const inUse = (key: string) => ({ isError: true, content: [{ type: 'text', text: JSON.stringify({ data: `The target device is already in use by a different session with key '${key}'. If that session is no longer needed, stop it first and retry.`, type: 'error' }) }] });
+/** Above macOS's process ID limit, so never a live process. */
+const crashedPid = 999_999;
+
+test('a device another Device Hub server holds is joined, and left running for that server', async (t) => {
+  const f = await fixture(t);
+  const other = new SessionRegistry(join(f.directory, 'registry'), process.ppid);
+  await other.hold({ key: 'Apple Device Hub 0A0B0C0D', deviceId: 'sim-1', deviceName: 'iPhone' }, 'other-session');
+  f.setToolHook(async name => name === 'DeviceInteractionStartSession' ? inUse('Apple Device Hub 0A0B0C0D') : undefined);
+  const session = await f.hub.connect('sim-1');
+  assert.equal(session.origin, 'device-hub');
+  assert.equal(f.calls.at(-1)?.args.interactSessionKey, 'Apple Device Hub 0A0B0C0D');
+  assert.equal(JSON.stringify(session).includes('0A0B0C0D'), false, 'the key stays on the server');
+  assert.deepEqual((await f.hub.status()).elsewhere, [{ deviceId: 'sim-1', deviceName: 'iPhone', holders: 1 }]);
+  await f.hub.disconnect(session.id);
+  assert.equal(f.calls.some(call => call.name === 'DeviceInteractionEndSession'), false);
+  assert.deepEqual((await other.find('Apple Device Hub 0A0B0C0D'))?.holders.map(holder => holder.sessionId), ['other-session']);
+});
+
+test('a session left by a crashed Device Hub server is adopted and ended by the last holder', async (t) => {
+  const f = await fixture(t);
+  await new SessionRegistry(join(f.directory, 'registry'), crashedPid).hold({ key: 'Apple Device Hub DEADBEEF', deviceId: 'sim-1', deviceName: 'iPhone' }, 'gone');
+  f.setToolHook(async name => name === 'DeviceInteractionStartSession' ? inUse('Apple Device Hub DEADBEEF') : undefined);
+  const session = await f.hub.connect('sim-1');
+  assert.equal(session.origin, 'device-hub');
+  assert.deepEqual((await f.hub.status()).elsewhere, []);
+  await f.hub.disconnect(session.id);
+  assert.deepEqual(f.calls.at(-1), { name: 'DeviceInteractionEndSession', args: { interactionSessionKey: 'Apple Device Hub DEADBEEF' } });
+});
+
+test("another tool's session is joined only with takeOver and never ended", async (t) => {
+  const f = await fixture(t);
+  f.setToolHook(async name => name === 'DeviceInteractionStartSession' ? inUse('Verify Login Flow') : undefined);
+  await assert.rejects(f.hub.connect('sim-1'), /in use by another tool's Xcode session, “Verify Login Flow”.*takeOver: true/);
+  assert.equal(f.calls.some(call => call.name === 'DeviceInteractionSynthesize'), false, 'nothing touches the device before consent');
+  const session = await f.hub.connect('sim-1', { takeOver: true });
+  assert.equal(session.origin, 'other-tool');
+  assert.equal(f.calls.at(-1)?.args.interactSessionKey, 'Verify Login Flow');
+  await f.hub.disconnect(session.id);
+  assert.equal(f.calls.some(call => call.name === 'DeviceInteractionEndSession'), false);
+});
+
+test('a session Xcode ended elsewhere expires, and the next connect starts fresh', async (t) => {
+  const f = await fixture(t);
+  const session = await f.hub.connect('sim-1');
+  f.setToolHook(async name => name === 'DeviceInteractionSynthesize'
+    ? { isError: true, content: [{ type: 'text', text: JSON.stringify({ data: 'Session not found. It may have already been closed, or the identifier is wrong', type: 'error' }) }] } : undefined);
+  await assert.rejects(f.hub.capture(session.id), SessionExpiredError);
+  assert.deepEqual((await f.hub.status()).sessions, []);
+  f.setToolHook(undefined);
+  const fresh = await f.hub.connect('sim-1');
+  assert.notEqual(fresh.id, session.id);
+  assert.equal(fresh.origin, 'new');
+});
+
+test('connecting another device points viewers of the first at it', async (t) => {
+  const f = await fixture(t);
+  f.setToolHook(async (name, args) => name === 'DeviceInteractionStartSession' ? { structuredContent: { interactionSessionKey: `key-${args.deviceIdentifier}` } } : undefined);
+  const first = await f.hub.connect('sim-1');
+  assert.equal((await f.hub.frame(first.id)).focus, undefined);
+  await f.hub.connect('physical-1');
+  assert.equal((await f.hub.frame(first.id)).focus?.deviceId, 'physical-1');
+  assert.equal((await f.hub.status()).focus?.deviceId, 'physical-1');
+  assert.equal((await f.hub.connect('sim-1')).origin, 'this-server');
+  assert.equal((await f.hub.frame(first.id)).focus, undefined, 'reconnecting refocuses the first device');
+});
+
+const runtimesList = JSON.stringify({ runtimes: [
+  { name: 'iOS 26.4', identifier: 'com.apple.CoreSimulator.SimRuntime.iOS-26-4', version: '26.4', platform: 'iOS', isAvailable: true, supportedDeviceTypes: [{ name: 'iPhone 17 Pro', identifier: 'com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro' }] },
+  { name: 'iOS 27.2', identifier: 'com.apple.CoreSimulator.SimRuntime.iOS-27-2', version: '27.2', platform: 'iOS', isAvailable: true, supportedDeviceTypes: [{ name: 'iPhone 17 Pro', identifier: 'com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro' }, { name: 'iPhone 18 Pro', identifier: 'com.apple.CoreSimulator.SimDeviceType.iPhone-18-Pro' }] },
+  { name: 'watchOS 27.0', identifier: 'com.apple.CoreSimulator.SimRuntime.watchOS-27-0', version: '27.0', platform: 'watchOS', isAvailable: true, supportedDeviceTypes: [{ name: 'Apple Watch Ultra 4 (49mm)', identifier: 'com.apple.CoreSimulator.SimDeviceType.Apple-Watch-Ultra-4-49mm' }] },
+  { name: 'iOS 28.0', identifier: 'com.apple.CoreSimulator.SimRuntime.iOS-28-0', version: '28.0', platform: 'iOS', isAvailable: false, supportedDeviceTypes: [{ name: 'iPhone 17 Pro', identifier: 'com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro' }] },
+] });
+
+test('simulator types resolve by name to the newest installed runtime, or the requested one', () => {
+  assert.deepEqual(resolveSimulatorType(runtimesList, 'iphone 17 pro'), { deviceType: { name: 'iPhone 17 Pro', identifier: 'com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro' }, runtime: { name: 'iOS 27.2', identifier: 'com.apple.CoreSimulator.SimRuntime.iOS-27-2' } });
+  assert.equal(resolveSimulatorType(runtimesList, 'iPhone 17 Pro', 'iOS 26').runtime.name, 'iOS 26.4');
+  assert.equal(resolveSimulatorType(runtimesList, 'iPhone 17 Pro', '26.4').runtime.name, 'iOS 26.4');
+  assert.equal(resolveSimulatorType(runtimesList, 'com.apple.CoreSimulator.SimDeviceType.iPhone-18-Pro').deviceType.name, 'iPhone 18 Pro');
+  assert.throws(() => resolveSimulatorType(runtimesList, 'iPhone Pro'), /“iPhone Pro” is not a simulator type.*iPhone 17 Pro, iPhone 18 Pro, Apple Watch Ultra 4 \(49mm\)/);
+  assert.throws(() => resolveSimulatorType(runtimesList, 'iPhone 17 Pro', 'watchOS'), /not a simulator type for watchOS\. Choose one of: Apple Watch Ultra 4 \(49mm\)\./);
+  assert.throws(() => resolveSimulatorType(runtimesList, 'iPhone 17 Pro', 'iOS 30'), /No installed simulator runtime matches “iOS 30”/);
+});
+
+test('simulators are created and cloned for testing, and only those Device Hub made are deleted', async (t) => {
+  const f = await fixture(t);
+  const created = '6F0C1B2A-0000-4000-8000-000000000001';
+  let devices: Record<string, unknown>[] = [simulator];
+  f.setCommandHook(async args => {
+    if (args[0] !== 'simctl') return undefined;
+    if (args[1] === 'list' && args[2] === 'runtimes') return runtimesList;
+    if (args[1] === 'list') return JSON.stringify({ devices: { 'com.apple.CoreSimulator.SimRuntime.iOS-27-2': devices } });
+    if (args[1] === 'create') { devices = [...devices, { udid: created, name: args[2], state: 'Shutdown', isAvailable: true }]; return `${created}\n`; }
+    if (args[1] === 'delete') { devices = devices.filter(device => device.udid !== args[2]); return ''; }
+    return undefined;
+  });
+  const device = await f.hub.createSimulator({ deviceType: 'iPhone 17 Pro' });
+  assert.deepEqual(f.commands.find(args => args[1] === 'create'), ['simctl', 'create', 'iPhone 17 Pro (Device Hub)', 'com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro', 'com.apple.CoreSimulator.SimRuntime.iOS-27-2']);
+  assert.deepEqual([device.id, device.createdByHub], [created, true]);
+  await assert.rejects(f.hub.deleteSimulator('sim-1'), /iPhone was not created by Device Hub/);
+  devices = devices.map(item => item.udid === 'sim-1' ? { ...item, state: 'Booted' } : item);
+  await assert.rejects(f.hub.createSimulator({ cloneFrom: 'sim-1' }), /iPhone is booted, and Xcode clones only shut-down simulators/);
+  const session = await f.hub.connect(created);
+  // A viewer in another window followed the agent onto the new simulator.
+  const viewer = new SessionRegistry(join(f.directory, 'registry'), process.ppid);
+  await viewer.hold({ key: 'secret-key', deviceId: created, deviceName: 'iPhone 17 Pro (Device Hub)' }, 'viewer-session');
+  await f.hub.deleteSimulator(created);
+  assert.ok(f.commands.some(args => args.join(' ') === `simctl delete ${created}`));
+  assert.deepEqual(f.calls.filter(call => call.name === 'DeviceInteractionEndSession').map(call => call.args.interactionSessionKey), ['secret-key'], 'its shared session ends once, before deletion');
+  assert.equal(await viewer.find('secret-key'), undefined);
+  assert.equal((await f.hub.status()).sessions.some(item => item.id === session.id), false);
+  assert.equal((await f.hub.status()).devices.some(item => item.id === created), false);
 });

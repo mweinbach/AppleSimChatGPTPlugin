@@ -310,9 +310,10 @@ test("live video keeps one read pending and streams touches and Home without Xco
     if (name === "device_input") return new Promise(resolve => { inputs.push({ events: args.events as unknown[], resolve }); });
     if (name === "device_action") return captured("action-still");
     if (name === "device_stream_stop") return { content: [], structuredContent: { stopped: true } };
+    if (name === "device_connect") return { isError: true, content: [{ type: "text", text: "Other Simulator is unavailable." }] };
     throw new Error(`Unexpected tool ${name}`);
   };
-  const batch = (sequence: number, unit: number[]) => ({ content: [], _meta: { "apple-device-hub/video": { sessionId: current.id, streamId: "1".padStart(48, "0"), sequence, active: true, frames: [Buffer.from(unit).toString("base64")] } } });
+  const batch = (sequence: number, unit: number[], extra: Record<string, unknown> = {}) => ({ content: [], _meta: { "apple-device-hub/video": { sessionId: current.id, streamId: "1".padStart(48, "0"), sequence, active: true, frames: [Buffer.from(unit).toString("base64")], ...extra } } });
   const replacements = {
     document, window,
     matchMedia: () => ({ matches: false }),
@@ -385,8 +386,17 @@ test("live video keeps one read pending and streams touches and Home without Xco
     assert.equal(inputs.length, 4);
     assert.deepEqual(calls.find(call => call.name === "device_action")!.args.action, { type: "tap", x: 110, y: 239 });
 
+    // A device the agent connected before the viewer opened is not followed; a later one is.
+    reads[2]!.resolve(batch(2, [0, 0, 1, 0x41, 0xcc], { focus: { deviceId: "stale", deviceName: "Stale Simulator", at: "2000-01-01T00:00:00.000Z" } }));
+    await flush();
+    assert.equal(calls.some(call => call.name === "device_connect"), false);
+    reads[3]!.resolve(batch(3, [0, 0, 1, 0x41, 0xcc], { focus: { deviceId: "other", deviceName: "Other Simulator", at: new Date(Date.now() + 1000).toISOString() } }));
+    await flush();
+    assert.deepEqual(calls.filter(call => call.name === "device_connect").map(call => call.args), [{ deviceId: "other" }]);
+    assert.match(viewer.getSnapshot().notice, /Other Simulator is unavailable/);
+
     // A skipped batch would corrupt the decoder's reference chain, so video reconnects instead.
-    reads[2]!.resolve(batch(3, [0, 0, 1, 0x41, 0xcc]));
+    reads[4]!.resolve(batch(5, [0, 0, 1, 0x41, 0xcc]));
     await flush();
     assert.equal(viewer.getSnapshot().videoReady, false);
     assert.match(viewer.getSnapshot().videoMessage, /out of order/);

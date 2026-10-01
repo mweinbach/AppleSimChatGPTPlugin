@@ -33,7 +33,7 @@ try {
     await client.connect(transport, { timeout: 15_000 });
     assert.equal(client.getServerVersion().version, version);
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 20);
+    assert.equal(tools.length, 22);
     const entrypoints = tools.flatMap(tool => tool._meta?.["openai/ui"]?.entrypoints ?? []).map(entry => entry.type);
     assert.deepEqual([...new Set(entrypoints)].sort(), ["global", "settings", "thread"]);
     const resource = await client.readResource({ uri: "ui://apple-device-hub/viewer" });

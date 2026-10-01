@@ -7,6 +7,7 @@ import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { WebSocket, type RawData } from "ws";
 import { AppleHub, type AppleBoundary } from "../src/apple.js";
+import { SessionRegistry } from "../src/session-registry.js";
 import { AccessUnitReader, LiveInputPacer, SimulatorVideo } from "../src/video.js";
 import { declareH264DecodeOrder, inspectVideoAccessUnit } from "../src/video-codec.js";
 
@@ -599,7 +600,7 @@ test("Apple interaction disconnect closes live video before ending the native se
     },
     async close() {},
   };
-  const hub = new AppleHub({ boundary, video: f.video });
+  const hub = new AppleHub({ boundary, video: f.video, registry: new SessionRegistry(join(directory, "registry")) });
   t.after(async () => { await hub.close(); await rm(directory, { recursive: true, force: true }); });
   await assert.rejects(hub.stream("unknown-session"), /expired or disconnected/);
   assert.equal(f.children.length, 0);

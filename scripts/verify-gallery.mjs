@@ -47,7 +47,7 @@ try {
     await client.connect(transport, { timeout: 15_000 });
     assert.equal(client.getServerVersion().version, version);
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 20);
+    assert.equal(tools.length, 22);
     for (const testCase of extension.review.test_cases.positive) {
       for (const name of testCase.tools_triggered.split(", ")) assert.ok(tools.some(tool => tool.name === name), `Review case references missing tool ${name}`);
     }
@@ -61,7 +61,7 @@ try {
     assert.deepEqual(await readFile(join(directory, "dist", file)), await readFile(join(root, "packages", "apple-device-hub-mcp", "dist", file)));
   }
   execFileSync("codesign", ["--verify", "--strict", join(directory, "dist", "simulator-stream")]);
-  console.log(`Verified apple-device-hub-${version}.zip: portable manifest, review metadata, isolated 20-tool MCP, viewer and signed native helper. Local MCP partner approval remains required.`);
+  console.log(`Verified apple-device-hub-${version}.zip: portable manifest, review metadata, isolated 22-tool MCP, viewer and signed native helper. Local MCP partner approval remains required.`);
 } finally {
   await rm(directory, { recursive: true, force: true });
 }

@@ -10,8 +10,22 @@ The user watches the device in the Apple Device Hub viewer while you work: live 
 ## Connect
 
 1. Call `open_device_hub` when the user wants to watch or hasn't opened the viewer.
-2. Call `device_hub_status`. Reuse a session in `sessions` if one matches the device the user means; they may have connected in the viewer. Otherwise call `device_connect` with a device `id`. Connecting boots a stopped simulator and takes a few seconds.
-3. Keep the session `id` for every later call.
+2. Call `device_hub_status`. It lists:
+   - sessions on this server, which you can reuse by session ID;
+   - devices open in another Device Hub chat or window;
+   - running devices, shut-down simulators and physical devices.
+3. Call `device_connect` with a device `id`:
+   - It boots a stopped simulator.
+   - If this server already has a session for the device, it returns that one.
+   - If another chat or window holds the device, it joins and shares that session.
+   The viewer switches to the device you connect, and its result says how the session was obtained.
+4. Keep the session ID for every later call.
+
+Choosing a device:
+
+- Use the device the user names. A running simulator may be one they are using themselves, so say before you drive it.
+- To test without touching the user's simulators, call `simulator_create` with a `deviceType` such as `"iPhone 17 Pro"`. It boots the new simulator and returns its session; an unknown type lists the choices. `cloneFrom` copies a shut-down simulator with its apps and data. When you're finished, delete the simulator with `simulator_delete`, which refuses any simulator Device Hub didn't create.
+- If `device_connect` says another tool's Xcode session holds the device, ask the user before passing `takeOver: true`. Both tools can then drive it, and Device Hub never ends the other tool's session.
 
 ## Observe, act, observe
 
@@ -46,7 +60,7 @@ If the elements don't explain what you expected to find, take one screenshot rat
 - Say briefly what you are about to do; the user sees each step happen.
 - Ask before actions that are hard to undo or act for the user: deleting data, purchases, sending messages, changing accounts. Hand sign-in, two-factor codes and system permission prompts to the user.
 - Input only reaches the device, never the Mac desktop.
-- Call `device_disconnect` when finished, unless the user is still using the viewer.
+- Call `device_disconnect` when finished, unless the user is still using the viewer. A chat or window sharing the session keeps it.
 
 ## Problems
 
@@ -55,4 +69,4 @@ If the elements don't explain what you expected to find, take one screenshot rat
 - "The device is still busy" or "did not finish": an earlier request is still running and its input may still land. Wait a moment and observe before repeating anything.
 - "The device may still be starting": a simulator is booting. Observe again in a few seconds.
 - A physical device that will not connect must be paired, unlocked and in Developer Mode; Apple decides eligibility when connecting.
-- "Device session expired": connect again with `device_connect`.
+- "Device session expired": the session ended, for example because another tool or an Xcode restart closed it. Connect again with `device_connect`.

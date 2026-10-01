@@ -8,12 +8,13 @@ import type { OpenAIUiToolMetadata } from "@openai/mcp-extensions/server";
 import type { AppleHub } from "./apple.js";
 import { SessionExpiredError } from "./apple.js";
 import { formatElement } from "./elements.js";
-import { actionSchema, HIERARCHY_META_KEY, liveInputSchema, settingsSchema, type Capture, type CaptureState } from "./shared.js";
+import { actionSchema, DATA_META_KEY, HIERARCHY_META_KEY, liveInputSchema, settingsSchema, type Capture, type CaptureState, type ConnectedSession, type Device, type HubState } from "./shared.js";
 import { computerAction, computerInputs, screenshotOption, type ComputerToolName } from "./computer.js";
-export { HIERARCHY_META_KEY };
+export { DATA_META_KEY, HIERARCHY_META_KEY };
 
 export const UI_URI = "ui://apple-device-hub/viewer";
-export type Hub = Pick<AppleHub, "status" | "connect" | "capture" | "frame" | "stream" | "streamRead" | "streamStop" | "input" | "action" | "settings" | "disconnect" | "close">;
+export type Hub = Pick<AppleHub, "status" | "connect" | "capture" | "frame" | "stream" | "streamRead" | "streamStop" | "input" | "action" | "settings" | "disconnect" | "createSimulator" | "deleteSimulator" | "close">;
+const deviceId = z.string().min(1).max(200);
 const sessionId = z.string().uuid();
 const resolution = z.enum(["points", "full"]).optional().describe("Image size. Leave unset: the default sizes the screenshot in logical points so image pixels equal tap coordinates.");
 export const toolInputs = {
@@ -21,7 +22,18 @@ export const toolInputs = {
   open_device_hub: z.object({}),
   device_hub_preferences: z.object({}),
   device_hub_status: z.object({}),
-  device_connect: z.object({ deviceId: z.string().min(1).max(200) }),
+  device_connect: z.object({
+    deviceId,
+    takeOver: z.boolean().optional().describe("Join a session another tool holds on this device. Ask the user first; sessions from other Device Hub chats or windows are joined without it."),
+  }),
+  simulator_create: z.object({
+    deviceType: z.string().min(1).max(200).optional().describe("Simulator type such as \"iPhone 17 Pro\" or \"iPad Air 13-inch (M4)\"; an unknown name lists the choices."),
+    runtime: z.string().min(1).max(100).optional().describe("Runtime such as \"iOS 27.2\" or \"iOS 27\"; the newest that supports the type when unset."),
+    cloneFrom: deviceId.optional().describe("ID of a shut-down simulator to copy with its apps and data, instead of deviceType."),
+    name: z.string().min(1).max(100).optional().describe("Name for the new simulator; defaults to the type with \"(Device Hub)\"."),
+    connect: z.boolean().default(true).describe("Boot the simulator and open a session (default true)."),
+  }).refine(value => Boolean(value.deviceType) !== Boolean(value.cloneFrom), "Choose either deviceType or cloneFrom."),
+  simulator_delete: z.object({ deviceId }),
   device_capture: z.object({ sessionId, accessibilityEnabled: z.boolean().optional(), resolution, screenshot: screenshotOption }),
   device_frame: z.object({ sessionId }),
   device_stream: z.object({ sessionId, codec: z.enum(["hevc", "h264"]).default("h264"), maxDimension: z.number().int().min(320).max(8192).optional().describe("Longest encoded edge in pixels; the simulator's resolution when larger or unset.") }),
@@ -69,23 +81,88 @@ export function captureResult(capture: Capture): CallToolResult {
   const state: CaptureState = { ...rest, ...(screenshot ? { screenshot: { mimeType: screenshot.mimeType, width: screenshot.width, height: screenshot.height } } : {}) };
   return {
     content: [{ type: "text", text: describeCapture(capture) }, ...(screenshot ? [{ type: "image" as const, data: screenshot.data, mimeType: screenshot.mimeType }] : [])],
-    structuredContent: state as unknown as Record<string, unknown>,
     // The viewer shows the raw tree; keeping it in _meta keeps it out of model context.
-    ...(hierarchy !== undefined ? { _meta: { [HIERARCHY_META_KEY]: hierarchy } } : {}),
+    _meta: { [DATA_META_KEY]: state, ...(hierarchy !== undefined ? { [HIERARCHY_META_KEY]: hierarchy } : {}) },
   };
 }
+/** For app-only tools, which the model never calls. */
 function dataResult(data: object): CallToolResult {
   return { content: [{ type: "text", text: JSON.stringify(data) }], structuredContent: data as Record<string, unknown> };
+}
+/** The model reads the text; the viewer reads the data. */
+function textResult(text: string, data: object): CallToolResult {
+  return { content: [{ type: "text", text }], _meta: { [DATA_META_KEY]: data } };
+}
+
+const deviceLine = (device: Device) => `${device.name} · ${device.runtime || device.platform}${device.kind === "device" ? " · physical device" : ""} · id ${device.id}${device.createdByHub ? " · created by Device Hub" : ""}`;
+const newestFirst = (left: Device, right: Device) => right.runtime.localeCompare(left.runtime, undefined, { numeric: true }) || left.name.localeCompare(right.name, undefined, { numeric: true });
+
+/** What the model needs to pick, join or create a session, without the full device JSON. */
+export function describeHub(state: HubState): string {
+  const lines: string[] = [];
+  const connected = new Set(state.sessions.map(session => session.device.id));
+  const shared = new Set(state.elsewhere?.map(session => session.deviceId));
+  if (state.sessions.length) {
+    lines.push("Sessions on this server (pass the session ID to other tools):", ...state.sessions.map(session =>
+      `- ${session.device.name} (${session.device.kind}, ${session.device.runtime}) · session ${session.id}${state.focus?.deviceId === session.device.id ? " · shown in the viewer" : ""}${shared.has(session.device.id) ? " · shared with another chat or window" : ""}`));
+  } else {
+    lines.push("No sessions on this server. device_connect opens one, or joins one already open in another chat or window.");
+  }
+  const elsewhere = state.elsewhere?.filter(session => !connected.has(session.deviceId)) ?? [];
+  if (elsewhere.length) {
+    lines.push("", "Open in another Device Hub chat or window (device_connect joins and shares it):", ...elsewhere.map(session =>
+      `- ${session.deviceName} · id ${session.deviceId}${session.otherTool ? " · taken over from another tool" : ""}`));
+  }
+  const available = state.devices.filter(device => device.available && !connected.has(device.id));
+  const running = available.filter(device => device.kind === "simulator" ? device.state === "Booted" : /connected/i.test(device.state));
+  const stopped = available.filter(device => device.kind === "simulator" && !running.includes(device)).sort(newestFirst);
+  const physical = state.devices.filter(device => device.kind === "device" && !connected.has(device.id) && !running.includes(device));
+  if (running.length) lines.push("", "Running (the user may be using these):", ...running.map(device => `- ${deviceLine(device)}`));
+  if (stopped.length) {
+    lines.push("", `Shut-down simulators (device_connect boots one):`, ...stopped.slice(0, 40).map(device => `- ${deviceLine(device)}`));
+    if (stopped.length > 40) lines.push(`- …and ${stopped.length - 40} more`);
+  }
+  if (physical.length) lines.push("", "Physical devices:", ...physical.map(device => `- ${deviceLine(device)} · ${device.available ? device.state : "unavailable"}`));
+  if (!state.devices.length) lines.push("", "No simulators or devices found.");
+  lines.push("", "simulator_create makes a fresh simulator, or clones a shut-down one, so testing does not disturb the user's own devices.");
+  if (state.warnings.length) lines.push("", ...state.warnings);
+  return lines.join("\n");
+}
+
+const origins = {
+  "new": "",
+  "this-server": " This session was already open on this server, possibly in the viewer, so you share it with the user.",
+  "device-hub": " Joined the session another Device Hub chat or window holds. Both can drive the device, so observe before acting.",
+  "other-tool": " Took over another tool's Xcode session. That tool may still drive the device, and Device Hub will not end its session.",
+} as const;
+export function describeConnection(session: ConnectedSession): string {
+  return `Connected to ${session.device.name} (${session.device.kind}, ${session.device.runtime}). Session ID: ${session.id}.${origins[session.origin]} The viewer now shows this device. Observe with device_capture or simulator_get_state before acting.`;
 }
 export async function callHubTool(hub: Hub, name: string, args: unknown): Promise<CallToolResult> {
   try {
     switch (name) {
-      case "open_device_hub": case "device_hub_preferences": case "device_hub_status":
+      case "open_device_hub": case "device_hub_preferences": case "device_hub_status": {
         toolInputs[name].parse(args);
-        return dataResult(await hub.status());
+        const state = await hub.status();
+        return textResult(describeHub(state), state);
+      }
       case "device_connect": {
         const input = toolInputs.device_connect.parse(args);
-        return dataResult(await hub.connect(input.deviceId));
+        const session = await hub.connect(input.deviceId, input.takeOver ? { takeOver: true } : {});
+        return textResult(describeConnection(session), session);
+      }
+      case "simulator_create": {
+        const input = toolInputs.simulator_create.parse(args);
+        const device = await hub.createSimulator({ ...(input.deviceType ? { deviceType: input.deviceType } : {}), ...(input.runtime ? { runtime: input.runtime } : {}), ...(input.cloneFrom ? { cloneFrom: input.cloneFrom } : {}), ...(input.name ? { name: input.name } : {}) });
+        const created = `Created ${device.name} (${device.runtime}), id ${device.id}. simulator_delete removes it when you are done.`;
+        if (!input.connect) return textResult(`${created} device_connect boots it.`, { device });
+        const session = await hub.connect(device.id);
+        return textResult(`${created} ${describeConnection(session)}`, session);
+      }
+      case "simulator_delete": {
+        const input = toolInputs.simulator_delete.parse(args);
+        const device = await hub.deleteSimulator(input.deviceId);
+        return textResult(`Deleted ${device.name}.`, { deviceId: device.id, deleted: true });
       }
       case "device_capture": {
         const input = toolInputs.device_capture.parse(args);
@@ -126,7 +203,7 @@ export async function callHubTool(hub: Hub, name: string, args: unknown): Promis
       case "device_disconnect": {
         const input = toolInputs.device_disconnect.parse(args);
         await hub.disconnect(input.sessionId);
-        return dataResult({ sessionId: input.sessionId, disconnected: true });
+        return textResult("Disconnected. The device stays as it is, and another chat or window sharing it keeps its session.", { sessionId: input.sessionId, disconnected: true });
       }
       case "simulator_get_state": {
         const input = computerInputs.simulator_get_state.parse(args);
@@ -157,13 +234,15 @@ export async function appHtml(assetRoot: URL, preview = false): Promise<string> 
 }
 
 export function createHubServer(hub: Hub, assetRoot: URL): McpServer {
-  const server = new McpServer({ name: "apple-device-hub", version }, { instructions: "Use open_device_hub to show the device viewer. Choose a device from device_hub_status and connect it, then observe before acting. Work in small verified steps: observe, act on one element by ref, then read the returned screen to confirm the result before the next step. Results are text-first: the element list describes the screen, and with the default screenshot: \"auto\" an image is attached only when the elements cannot describe it. Pass screenshot: \"always\" to judge layout, color or images. Coordinates are logical device points in coordinateSpace. accessibilityEnabled controls whether elements are exposed; it does not change iOS accessibility settings. Device operations pass through Apple's Xcode bridge. Restore changed settings and disconnect sessions when finished." });
+  const server = new McpServer({ name: "apple-device-hub", version }, { instructions: "Use open_device_hub to show the device viewer. device_hub_status lists sessions on this server, devices open in other Device Hub chats or windows, and every device. Reuse a listed session ID, or device_connect a device: it boots a stopped simulator, reuses this server's session, or joins the one another chat or window holds, and the viewer follows it. To keep testing off the user's own simulator, simulator_create makes a fresh one (or clones a shut-down one); simulator_delete removes it afterwards. Observe before acting. Work in small verified steps: observe, act on one element by ref, then read the returned screen to confirm the result before the next step. Results are text-first: the element list describes the screen, and with the default screenshot: \"auto\" an image is attached only when the elements cannot describe it. Pass screenshot: \"always\" to judge layout, color or images. Coordinates are logical device points in coordinateSpace. accessibilityEnabled controls whether elements are exposed; it does not change iOS accessibility settings. Device operations pass through Apple's Xcode bridge. Restore changed settings and disconnect sessions when finished." });
   registerAppResource(server, "Apple Device Hub", UI_URI, {}, async () => ({ contents: [{ uri: UI_URI, mimeType: RESOURCE_MIME_TYPE, text: await appHtml(assetRoot), _meta: { ui: { prefersBorder: false } } }] }));
   const definitions: { name: ToolName; title: string; description: string; readOnly: boolean; destructive?: boolean; openWorld?: boolean; appOnly?: boolean; opening?: OpenAIUiToolMetadata }[] = [
     { name: "open_device_hub", title: "Apple Device Hub", description: "Open the local Apple Device Hub. View and control simulators or connected Apple devices beside the conversation.", readOnly: true, opening: { entrypoints: [{ type: "global" }, { type: "thread" }], preferredModelDisplayMode: "fullscreen" } },
     { name: "device_hub_preferences", title: "Device Hub settings", description: "Open Apple Device Hub device and accessibility controls.", readOnly: true, opening: { entrypoints: [{ type: "settings", searchTerms: ["device", "simulator", "accessibility"] }] } },
-    { name: "device_hub_status", title: "List Apple devices", description: "List local simulators, paired physical device candidates, and active interaction sessions. Physical-device availability reflects discovery and pairing; successful device_connect confirms Apple's interaction eligibility.", readOnly: true },
-    { name: "device_connect", title: "Connect device", description: "Start an Apple device interaction session for a device ID from the inventory. Boots a simulator when needed. Returns a local session ID; Apple's secret session key stays on the server.", readOnly: false },
+    { name: "device_hub_status", title: "List Apple devices", description: "List sessions open on this server (reuse their session IDs), devices open in other Device Hub chats or windows, running devices, shut-down simulators and paired physical devices. Physical-device availability reflects discovery and pairing; device_connect confirms Apple's interaction eligibility.", readOnly: true },
+    { name: "device_connect", title: "Connect device", description: "Open an interaction session on a device ID from device_hub_status and show it in the viewer. Boots a stopped simulator. If this server already has a session for the device, returns it; if another Device Hub chat or window holds the device, joins and shares that session. A device held by another tool needs takeOver: true, after asking the user. Returns a session ID for the other tools; Xcode's session key stays on the server.", readOnly: false },
+    { name: "simulator_create", title: "Create simulator", description: "Create a new simulator by device type (for example \"iPhone 17 Pro\"), optionally on a specific runtime, or clone a shut-down simulator with its apps and data. By default it boots the simulator and opens a session, returning the session ID. Use it to test without disturbing the user's own simulators.", readOnly: false },
+    { name: "simulator_delete", title: "Delete simulator", description: "End its sessions, shut down and delete a simulator that Device Hub created with simulator_create, including in viewers that followed it. Refuses any other simulator.", readOnly: false, destructive: true },
     { name: "device_capture", title: "Capture device screen", description: "Observe the device: returns the on-screen accessibility elements (role, label, identifier, value, tap point) as text, plus a screenshot sized in logical points when the elements cannot describe the screen or screenshot is \"always\". Call this before acting, then act on elements by ref with device_action. accessibilityEnabled shows or hides elements in the output; it does not change VoiceOver.", readOnly: true },
     { name: "device_frame", title: "Stream device frame", description: "Return a compressed screen-only frame for the live viewer. No accessibility hierarchy or settings.", readOnly: true, appOnly: true },
     { name: "device_stream", title: "Stream simulator video", description: "Start a stateful live hardware HEVC or H.264 simulator video connection for the viewer. Accessibility and device actions continue through MCP tools.", readOnly: false, appOnly: true },
